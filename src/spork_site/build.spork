@@ -7,7 +7,6 @@
     [spork-site.transforms :refer [transform]])
   (:import
     [collections.abc :refer [Mapping Set :as AbstractSet]]
-    [importlib :refer [import_module]]
     [os.path :refer [abspath]]
     [pathlib :refer [Path PurePosixPath]]
     [shutil :refer [copyfile rmtree]]))
@@ -241,23 +240,3 @@
     (if (root.exists)
       (if (root.is-symlink) (root.unlink) (rmtree root)))
     root))
-
-(defn load-site [target]
-  "Load a built Python/Spork module value from module:attribute."
-  (if (not (isinstance target str))
-    (throw (TypeError "site target must be a module:attribute string")))
-  (let [parts (.rsplit target ":" 1)]
-    (if (not (= (count parts) 2))
-      (throw (ValueError "site target must use module:attribute syntax")))
-    (let [module (import_module (nth parts 0))
-          value (getattr module (nth parts 1))
-          loaded (if (callable value) (value) value)]
-      (if (not (isinstance loaded Mapping))
-        (throw (TypeError "loaded site value must be a map")))
-      loaded)))
-
-(defn build-target
-  ([target]
-   (build-site (load-site target)))
-  ([target output]
-   (build-site (load-site target) output)))

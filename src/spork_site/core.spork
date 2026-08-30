@@ -22,9 +22,8 @@
     [spork-site.routing :refer [normalize-pages normalize-route output-file
                                  page pages-for route-output-path
                                  route-output-relative route-table]]
-    [spork-site.build :refer [asset build-plan build-site build-target
-                               check-site clean-site discover-assets load-site
-                               site site-routes]]
+    [spork-site.build :refer [asset build-plan build-site check-site clean-site
+                               discover-assets site site-routes]]
     [spork-site.sitemap :refer [sitemap sitemap-entry]]
     [spork-site.feeds :refer [atom rss]]))
 

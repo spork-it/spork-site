@@ -42,7 +42,16 @@
   (assert (is arguments.json_output true))
   (def routes (.parse_args (cli.make-parser) ["routes" "--json"]))
   (assert (= routes.action "routes"))
-  (assert (is routes.json_output true)))
+  (assert (is routes.json_output true))
+  (def serve
+    (.parse_args (cli.make-parser)
+                 ["serve" "--host" "0.0.0.0" "--port" "0"
+                  "--open" "--no-reload"]))
+  (assert (= serve.action "serve"))
+  (assert (= serve.host "0.0.0.0"))
+  (assert (= serve.port 0))
+  (assert (is serve.open_browser true))
+  (assert (is serve.no_reload true)))
 
 (deftest check-and-routes-load-source-factory-without-writing
   (with [directory (TemporaryDirectory)]

@@ -1,51 +1,20 @@
-;; Package-owned `spork site ...` command provider and legacy CLI facade.
+;; Package-owned `spork site ...` command provider.
 (ns spork-site.cli
   (:require
-    [spork-site.build :as build])
+    [spork-site.dev :as dev])
   (:import
-    [argparse :refer [ArgumentParser]]
+    [argparse :refer [ArgumentParser SUPPRESS]]
     [builtins :refer [dict list]]
     [collections.abc :refer [Mapping]]
     [importlib.metadata :as metadata]
     [json :refer [dumps]]
     [os :refer [chdir]]
+    [os.path :refer [abspath]]
     [pathlib :refer [Path]]
     [sys :as sys]
     [time :refer [perf_counter]]))
 
-(def version-string "0.1.0")
-
-(def legacy-usage
-  "Usage:\n  spork run build MODULE:ATTRIBUTE [OUTPUT]\n  spork run clean [OUTPUT]\n  spork run version")
-
-(defn print-summary [summary]
-  (print
-    (fmt "Built {} pages and {} assets in {}"
-         (:pages summary) (:assets summary) (:output summary))))
-
-(defn ^int main [& args]
-  "Compatibility facade for the former `spork run` workflow."
-  (if (= (count args) 0)
-    (do (print legacy-usage) 2)
-    (let [action (first args)]
-      (cond
-        (= action "version")
-          (do (print version-string) 0)
-        (= action "build")
-          (if (or (< (count args) 2) (> (count args) 3))
-            (do (print legacy-usage) 2)
-            (let [summary (if (= (count args) 3)
-                            (build.build-target (nth args 1) (nth args 2))
-                            (build.build-target (nth args 1)))]
-              (print-summary summary)
-              0))
-        (= action "clean")
-          (if (> (count args) 2)
-            (do (print legacy-usage) 2)
-            (do
-              (build.clean-site (if (= (count args) 2) (nth args 1) "dist"))
-              0))
-        :else (do (print legacy-usage) 2)))))
+(def version-string "0.1.1")
 
 (defn make-parser []
   (let [parser
@@ -70,7 +39,11 @@
         routes-parser
           (commands.add_parser
             "routes" * :help "list canonical routes and output paths"
-                       :description "List canonical routes and output paths")]
+                       :description "List canonical routes and output paths")
+        serve-parser
+          (commands.add_parser
+            "serve" * :help "serve and rebuild the site during development"
+                      :description "Serve fresh full-build generations and reload browsers")]
     (build-parser.add_argument
       "--output" * :metavar "PATH" :help "override the configured output directory")
     (build-parser.add_argument
@@ -79,6 +52,9 @@
     (build-parser.add_argument
       "--json" * :dest "json_output" :action "store_true"
                  :help "write a machine-readable build summary")
+    (build-parser.add_argument
+      "--development-generation"
+      * :dest "development_generation" :action "store_true" :help SUPPRESS)
     (check-parser.add_argument
       "--json" * :dest "json_output" :action "store_true"
                  :help "write a machine-readable validation summary")
@@ -87,6 +63,18 @@
     (routes-parser.add_argument
       "--json" * :dest "json_output" :action "store_true"
                  :help "write routes as JSON")
+    (serve-parser.add_argument
+      "--host" * :default "127.0.0.1" :metavar "HOST"
+                 :help "interface to bind (default: 127.0.0.1)")
+    (serve-parser.add_argument
+      "--port" * :default 8000 :type int :metavar "PORT"
+                 :help "port to bind; 0 selects an available port (default: 8000)")
+    (serve-parser.add_argument
+      "--open" * :dest "open_browser" :action "store_true"
+                 :help "open the development URL in a browser")
+    (serve-parser.add_argument
+      "--no-reload" * :dest "no_reload" :action "store_true"
+                      :help "serve one build without watching or browser reload")
     (commands.add_parser
       "version" * :help "show provider and Spork host versions"
                   :description "Show provider and Spork host versions")
@@ -99,8 +87,8 @@
   (print (+ "Error: " message) * :file sys.stderr)
   nil)
 
-(defn load-project-site [context]
-  "Load and call the configured source-only site factory."
+(defn configured-site-settings [context]
+  "Validate and return package-owned :site manifest settings."
   (let [project (context.require-project)
         settings (project.get-plugin-config "site")]
     (cond
@@ -111,21 +99,26 @@
         (configuration-error ":site must be a map")
       :else
         (let [target (get settings "target")]
-          (cond
-            (or (not (isinstance target str)) (= (.strip target) ""))
-              (configuration-error ":site :target must be a non-empty namespace:function string")
-            :else
-              (let [factory (context.load-entry target)]
-                (cond
-                  (not (callable factory))
-                    (configuration-error
-                      (fmt ":site target {} must resolve to a callable factory" (repr target)))
-                  :else
-                    (let [site-value (factory)]
-                      (if (not (isinstance site-value Mapping))
-                        (configuration-error
-                          (fmt ":site target {} must return a site map" (repr target)))
-                        site-value)))))))))
+          (if (or (not (isinstance target str)) (= (.strip target) ""))
+            (configuration-error ":site :target must be a non-empty namespace:function string")
+            settings)))))
+
+(defn load-project-site [context]
+  "Load and call the configured source-only site factory."
+  (let [settings (configured-site-settings context)]
+    (if (not (= settings nil))
+      (let [target (get settings "target")
+            factory (context.load-entry target)]
+        (cond
+          (not (callable factory))
+            (configuration-error
+              (fmt ":site target {} must resolve to a callable factory" (repr target)))
+          :else
+            (let [site-value (factory)]
+              (if (not (isinstance site-value Mapping))
+                (configuration-error
+                  (fmt ":site target {} must return a site map" (repr target)))
+                site-value)))))))
 
 (defn with-project-root [context function]
   "Run one operation from the manifest root and always restore the caller cwd."
@@ -173,7 +166,12 @@
             summary (build-site site-value arguments.output clean-override)
             duration (- (perf_counter) started)]
         (if arguments.json_output
-          (print-json (build-payload summary duration))
+          (let [payload (build-payload summary duration)]
+            (if arguments.development_generation
+              (payload.update
+                {"configured_output"
+                 (str (Path (abspath (get site-value :output "dist"))))}))
+            (print-json payload))
           (print
             (fmt "Built {} pages and {} assets in {:.3f}s -> {}"
                  (:pages summary) (:assets summary) duration (:output summary))))
@@ -232,6 +230,23 @@
               (print (fmt "{}\t{}" (:route route) (:output route))))))
         0))))
 
+(defn run-serve [context arguments]
+  (let [settings (configured-site-settings context)]
+    (if (= settings nil)
+      1
+      (try
+        (dev.run-server
+          context.project-root settings arguments.host arguments.port
+          arguments.open_browser (not arguments.no_reload))
+        (catch ValueError error
+          (configuration-error (str error))
+          1)
+        (catch OSError error
+          (configuration-error (str error))
+          1)
+        (catch KeyboardInterrupt error
+          0)))))
+
 (defn run-version [context]
   (let [provider-version (or context.provider.version version-string)
         host-version (metadata.version "spork-lang")]
@@ -249,5 +264,6 @@
       (= arguments.action "check") (run-check context arguments)
       (= arguments.action "clean") (run-clean context arguments)
       (= arguments.action "routes") (run-routes context arguments)
+      (= arguments.action "serve") (run-serve context arguments)
       (= arguments.action "version") (run-version context)
       :else 2)))

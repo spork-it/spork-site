@@ -112,6 +112,7 @@ jobs:
                   "markdown-it-py",
                   "python-frontmatter",
                   "Pygments",
+                  "watchfiles",
               )
           }
           if not expected.issubset(dependency_names):
@@ -169,6 +170,7 @@ jobs:
           assert version("markdown-it-py")
           assert version("python-frontmatter")
           assert version("Pygments")
+          assert version("watchfiles")
           try:
               version("spork-lang")
           except PackageNotFoundError:

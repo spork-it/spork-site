@@ -1,0 +1,515 @@
+;; Full-rebuild development server with isolated generations and browser reload.
+(ns spork-site.dev
+  (:import
+    [collections.abc :refer [Sequence]]
+    [functools :refer [partial]]
+    [html :refer [escape]]
+    [http.server :refer [BaseHTTPRequestHandler ThreadingHTTPServer]]
+    [json :refer [loads]]
+    [mimetypes :refer [guess_type]]
+    [os :refer [environ]]
+    [pathlib :refer [Path PurePosixPath]]
+    [shutil :refer [rmtree]]
+    [socket :refer [AF_INET6]]
+    [subprocess :as subprocess]
+    [sys :as sys]
+    [tempfile :refer [TemporaryDirectory]]
+    [threading :refer [Condition Event Thread]]
+    [time :refer [perf_counter]]
+    [urllib.parse :refer [unquote urlsplit]]
+    [watchfiles :refer [watch]]
+    [webbrowser :as webbrowser]))
+
+(def reload-endpoint "/_spork-site/reload")
+
+(def reload-client
+  (.encode
+    (+ "<script data-spork-site-reload>"
+       "(()=>{const source=new EventSource('" reload-endpoint "');"
+       "source.addEventListener('reload',()=>window.location.reload());})();"
+       "</script>")
+    "utf-8"))
+
+(def ignored-directory-names
+  #{".git" ".hg" ".svn" ".venv" ".spork-out"
+    ".pytest_cache" ".mypy_cache" ".ruff_cache" ".tox"
+    "__pycache__" "node_modules"})
+
+(def default-watch-paths ["spork.it" "src" "content" "static"])
+
+(defn inject-reload-client [content enabled?]
+  "Inject the development client into served HTML without changing build output."
+  (if (not enabled?)
+    content
+    (let [lower (.lower content)
+          marker (.encode "</body>" "utf-8")
+          position (.rfind lower marker)]
+      (if (= position -1)
+        (+ content reload-client)
+        (+ (get content (slice 0 position))
+           reload-client
+           (get content (slice position nil)))))))
+
+(defclass GenerationState []
+  (def __slots__
+    (tuple ["condition" "root" "generation" "revision" "error" "stopped"
+            "reload_enabled"]))
+
+  (defn __init__ [self reload-enabled]
+    (set! self.condition (Condition))
+    (set! self.root nil)
+    (set! self.generation nil)
+    (set! self.revision 0)
+    (set! self.error nil)
+    (set! self.stopped false)
+    (set! self.reload_enabled (bool reload-enabled)))
+
+  (defn snapshot [self]
+    (with [locked self.condition]
+      (tuple [self.root self.revision self.error self.stopped self.generation])))
+
+  (defn activate [self root generation]
+    (with [locked self.condition]
+      (set! self.root (Path root))
+      (set! self.generation generation)
+      (set! self.revision (inc self.revision))
+      (set! self.error nil)
+      (self.condition.notify_all)
+      self.revision))
+
+  (defn fail [self message]
+    (with [locked self.condition]
+      (set! self.error message)))
+
+  (defn wait-for-change [self revision timeout]
+    (with [locked self.condition]
+      (self.condition.wait_for
+        (fn [] (or self.stopped (> self.revision revision)))
+        timeout)
+      (tuple [self.revision self.stopped])))
+
+  (defn stop [self]
+    (with [locked self.condition]
+      (set! self.stopped true)
+      (self.condition.notify_all))))
+
+(defn relative-request-path [raw-path]
+  (let [decoded (unquote (. (urlsplit raw-path) path))]
+    (if (or (in "\\" decoded) (in (chr 0) decoded))
+      nil
+      (let [relative (.lstrip decoded "/")
+            parts (. (PurePosixPath relative) parts)]
+        (if (some (fn [part] (or (= part ".") (= part "..") (= part ""))) parts)
+          nil
+          (if (= relative "") "index.html" relative))))))
+
+(defn resolve-request [root raw-path]
+  "Resolve one URL against a generation without permitting traversal."
+  (let [relative (relative-request-path raw-path)]
+    (if (= relative nil)
+      {:kind :invalid}
+      (let [root-path (.resolve (Path root))
+            parts (. (PurePosixPath relative) parts)
+            candidate (.resolve (apply root-path.joinpath parts))]
+        (if (and (not (= candidate root-path))
+                 (not (in root-path candidate.parents)))
+          {:kind :invalid}
+          (if (candidate.is-dir)
+            (if (not (.endswith (. (urlsplit raw-path) path) "/"))
+              {:kind :redirect
+               :location (+ (. (urlsplit raw-path) path) "/")}
+              (let [index (candidate.joinpath "index.html")]
+                (if (index.is-file)
+                  {:kind :file :path index}
+                  {:kind :missing})))
+            (if (candidate.is-file)
+              {:kind :file :path candidate}
+              {:kind :missing})))))))
+
+(defn content-type [path]
+  (let [guessed (first (guess_type (str path)))
+        selected (if (= guessed nil) "application/octet-stream" guessed)]
+    (if (or (.startswith selected "text/")
+            (contains? #{"application/javascript" "application/json"
+                         "application/xml" "image/svg+xml"}
+                       selected))
+      (+ selected "; charset=utf-8")
+      selected)))
+
+(defn send-bytes
+  ([handler status body media-type head?]
+   (send-bytes handler status body media-type head? []))
+  ([handler status body media-type head? headers]
+   (handler.send_response status)
+   (handler.send_header "Content-Type" media-type)
+   (handler.send_header "Content-Length" (str (len body)))
+   (handler.send_header "Cache-Control" "no-store")
+   (doseq [pair headers]
+     (handler.send_header (nth pair 0) (nth pair 1)))
+   (handler.end_headers)
+   (if (not head?)
+     (handler.wfile.write body))))
+
+(defn error-page [message]
+  (.encode
+    (fmt "<!doctype html><html><head><meta charset=\"utf-8\"><title>spork-site</title></head><body><main><h1>Site unavailable</h1><pre>{}</pre></main></body></html>"
+         (escape message))
+    "utf-8"))
+
+(defn send-reload-event [handler revision next-revision]
+  (try
+    (if (> next-revision revision)
+      (handler.wfile.write
+        (.encode
+          (fmt "id: {}\nevent: reload\ndata: {}\n\n"
+               next-revision next-revision)
+          "utf-8"))
+      (handler.wfile.write (.encode ": keep-alive\n\n" "utf-8")))
+    (handler.wfile.flush)
+    next-revision
+    (catch Exception error
+      nil)))
+
+(defn reload-event-loop [handler state initial-revision]
+  (loop [revision initial-revision]
+    (let [changed (state.wait-for-change revision 15.0)
+          next-revision (nth changed 0)
+          stopped? (nth changed 1)]
+      (if (not stopped?)
+        (let [sent (send-reload-event handler revision next-revision)]
+          (if (not (= sent nil))
+            (recur sent)))))))
+
+(defn serve-reload-events [handler state]
+  (handler.send_response 200)
+  (handler.send_header "Content-Type" "text/event-stream")
+  (handler.send_header "Cache-Control" "no-cache")
+  (handler.send_header "Connection" "keep-alive")
+  (handler.end_headers)
+  (set! handler.close_connection false)
+  (let [snapshot (state.snapshot)]
+    (reload-event-loop handler state (nth snapshot 1)))
+  (set! handler.close_connection true))
+
+(defn serve-static-request [handler head?]
+  (let [state handler.server.development_state
+        parsed (urlsplit handler.path)]
+    (if (= parsed.path reload-endpoint)
+      (if (and (not head?) state.reload_enabled)
+        (serve-reload-events handler state)
+        (send-bytes handler 404 (.encode "Not found\n" "utf-8")
+                    "text/plain; charset=utf-8" head?))
+      (let [snapshot (state.snapshot)
+            root (nth snapshot 0)
+            failure (nth snapshot 2)]
+        (if (= root nil)
+          (let [body (inject-reload-client
+                       (error-page
+                         (or failure "Waiting for the first successful build."))
+                       state.reload_enabled)]
+            (send-bytes handler 503 body "text/html; charset=utf-8" head?))
+          (let [resolved (resolve-request root handler.path)
+                kind (:kind resolved)]
+            (cond
+              (= kind :invalid)
+                (send-bytes handler 400 (.encode "Invalid path\n" "utf-8")
+                            "text/plain; charset=utf-8" head?)
+              (= kind :missing)
+                (send-bytes handler 404 (.encode "Not found\n" "utf-8")
+                            "text/plain; charset=utf-8" head?)
+              (= kind :redirect)
+                (send-bytes handler 301 (.encode "Redirecting\n" "utf-8")
+                            "text/plain; charset=utf-8" head?
+                            [["Location" (:location resolved)]])
+              :else
+                (let [path (:path resolved)
+                      generation (nth snapshot 4)
+                      html? (= (.lower path.suffix) ".html")
+                      body (inject-reload-client (path.read_bytes)
+                                                 (and html? state.reload_enabled))]
+                  (send-bytes handler 200 body (content-type path) head?
+                              [["X-Spork-Site-Generation" (str generation)]])))))))))
+
+(defclass IPv6ThreadingHTTPServer [ThreadingHTTPServer]
+  (def address_family AF_INET6))
+
+(defclass DevelopmentRequestHandler [BaseHTTPRequestHandler]
+  (def protocol_version "HTTP/1.1")
+  (def server_version "spork-site")
+
+  (defn do_GET [self]
+    (serve-static-request self false))
+
+  (defn do_HEAD [self]
+    (serve-static-request self true))
+
+  (defn log_message [self format & args]
+    nil))
+
+(defn create-server [host port state]
+  (let [server-type (if (in ":" host) IPv6ThreadingHTTPServer ThreadingHTTPServer)
+        server (server-type (tuple [host port]) DevelopmentRequestHandler)]
+    (set! server.development_state state)
+    (set! server.daemon_threads true)
+    (set! server.block_on_close false)
+    server))
+
+(defn watch-path-values [settings]
+  (let [configured (get settings "watch" nil)]
+    (if (= configured nil)
+      default-watch-paths
+      (do
+        (if (or (isinstance configured str)
+                (not (isinstance configured Sequence)))
+          (throw (ValueError ":site :watch must be a sequence of relative paths")))
+        (if (= (count configured) 0)
+          (throw (ValueError ":site :watch must contain at least one path")))
+        configured))))
+
+(defn normalize-watch-paths [root values]
+  (let [root-path (.resolve (Path root))]
+    (into []
+      (for [value values]
+        (do
+          (if (or (not (isinstance value str)) (= (.strip value) ""))
+            (throw (ValueError ":site :watch entries must be non-empty path strings")))
+          (let [path (PurePosixPath value)]
+            (if (or (path.is-absolute) (in ".." path.parts) (in "\\" value))
+              (throw (ValueError ":site :watch entries must be safe relative paths")))
+            (let [resolved (.resolve (root-path.joinpath value))]
+              (if (and (not (= resolved root-path))
+                       (not (in root-path resolved.parents)))
+                (throw (ValueError ":site :watch entries must remain inside the project")))
+              resolved)))))))
+
+(defn nearest-watch-root [root path]
+  (loop [candidate (Path path)]
+    (if (or (candidate.exists) (= candidate root))
+      candidate
+      (recur candidate.parent))))
+
+(defn select-watch-roots [root watch-paths]
+  "Watch configured files/directories directly instead of traversing the venv."
+  (into []
+    (sorted
+      (set (map (fn [path] (nearest-watch-root root path)) watch-paths))
+      *{:key (fn [path] (str path))})))
+
+(defclass ProjectWatchFilter []
+  (def __slots__ (tuple ["root" "watch_paths" "output"]))
+
+  (defn __init__ [self root watch-paths]
+    (set! self.root (.resolve (Path root)))
+    (set! self.watch_paths (tuple watch-paths))
+    (set! self.output nil))
+
+  (defn set-output [self output]
+    (if (not (= output nil))
+      (set! self.output (.resolve (Path output)))))
+
+  (defn __call__ [self change path]
+    (try
+      (let [candidate (.resolve (Path path))
+            relative (candidate.relative_to self.root)]
+        (and
+          (not (some (fn [part] (contains? ignored-directory-names part))
+                     relative.parts))
+          (or (= self.output nil)
+              (and (not (= candidate self.output))
+                   (not (in self.output candidate.parents))))
+          (some
+            (fn [watched]
+              (or (= candidate watched) (in watched candidate.parents)))
+            self.watch_paths)))
+      (catch ValueError error
+        false))))
+
+(defn worker-environment []
+  (let [environment (environ.copy)]
+    (environment.pop "PYTHONPATH" nil)
+    (environment.update {"PYTHONIOENCODING" "utf-8"
+                         "PYTHONUNBUFFERED" "1"})
+    environment))
+
+(defn remove-generation [path]
+  (let [generation (Path path)]
+    (if (generation.exists)
+      (try
+        (rmtree generation)
+        (catch OSError error
+          nil)))))
+
+(defn worker-error [result]
+  (let [stdout (.strip result.stdout)
+        stderr (.strip result.stderr)]
+    (cond
+      (and (not (= stderr "")) (not (= stdout "")))
+        (fmt "{}\n{}" stderr stdout)
+      (not (= stderr "")) stderr
+      (not (= stdout "")) stdout
+      :else (fmt "build worker exited with status {}" result.returncode))))
+
+(defn build-generation [project-root generation number]
+  "Build one complete generation in a fresh project command process."
+  (let [started (perf_counter)
+        command (list [sys.executable "-m" "spork" "site" "build"
+                       "--output" (str generation) "--json"
+                       "--development-generation"])
+        result
+          (subprocess.run
+            command
+            * :cwd (str project-root)
+              :env (worker-environment)
+              :capture_output true
+              :text true
+              :encoding "utf-8"
+              :errors "replace")
+        duration (- (perf_counter) started)]
+    (if (not (= result.returncode 0))
+      (do
+        (remove-generation generation)
+        {:ok false :number number :duration duration
+         :error (worker-error result)})
+      (try
+        (let [summary (loads result.stdout)]
+          {:ok true :number number :duration duration
+           :generation (Path generation) :summary summary})
+        (catch Exception error
+          (remove-generation generation)
+          {:ok false :number number :duration duration
+           :error (fmt "build worker returned invalid JSON: {}\n{}"
+                       error (.strip result.stdout))})))))
+
+(defn changed-paths [root changes]
+  (sorted
+    (set
+      (for [change changes]
+        (let [path (Path (nth change 1))]
+          (try
+            (.as_posix (path.relative_to root))
+            (catch ValueError error
+              (str path))))))))
+
+(defn report-success [result initial?]
+  (let [summary (:summary result)
+        verb (if initial? "Built" "Rebuilt")]
+    (print
+      (fmt "{} generation {}: {} pages, {} assets in {:.3f}s"
+           verb (:number result) (get summary "pages") (get summary "assets")
+           (:duration result))
+      * :flush true)))
+
+(defn report-failure [state result]
+  (let [snapshot (state.snapshot)
+        active (nth snapshot 4)
+        suffix (if (not (= active nil))
+                 (fmt "; continuing to serve generation {}" active)
+                 "; no successful generation is available")]
+    (print
+      (fmt "Build failed after {:.3f}s{}\n{}"
+           (:duration result) suffix (:error result))
+      * :file sys.stderr :flush true)))
+
+(defn activate-generation [state filter successful result]
+  (let [generation (:generation result)
+        summary (:summary result)
+        configured-output (get summary "configured_output" nil)]
+    (filter.set-output configured-output)
+    (state.activate generation (:number result))
+    (successful.append generation)
+    (if (> (len successful) 2)
+      (remove-generation (successful.pop 0)))))
+
+(defn display-host [host]
+  (cond
+    (= host "0.0.0.0") "127.0.0.1"
+    (= host "::") "[::1]"
+    (in ":" host) (+ "[" host "]")
+    :else host))
+
+(defn run-server [project-root settings host port open? reload?]
+  "Serve full fresh generations until interrupted."
+  (if (or (< port 0) (> port 65535))
+    (throw (ValueError "--port must be between 0 and 65535")))
+  (if (= (.strip host) "")
+    (throw (ValueError "--host must not be empty")))
+  (let [root (.resolve (Path project-root))
+        watch-paths (normalize-watch-paths root (watch-path-values settings))
+        watch-roots (select-watch-roots root watch-paths)
+        filter (ProjectWatchFilter root watch-paths)
+        state (GenerationState reload?)
+        successful (list)
+        stop-event (Event)]
+    (with [temporary (TemporaryDirectory * :prefix "spork-site-serve-")]
+      (let [generation-root (Path temporary)
+            initial-path (generation-root.joinpath "generation-000001")
+            initial (build-generation root initial-path 1)]
+        (if (:ok initial)
+          (do
+            (activate-generation state filter successful initial)
+            (report-success initial true))
+          (do
+            (state.fail (:error initial))
+            (report-failure state initial)))
+        (if (and (not reload?) (not (:ok initial)))
+          1
+          (let [server (create-server host port state)
+                actual-port (nth server.server_address 1)
+                browser-host (display-host host)
+                url (fmt "http://{}:{}/" browser-host actual-port)
+                thread
+                  (Thread * :target server.serve_forever
+                            :name "spork-site-http" :daemon true)]
+            (thread.start)
+            (print (fmt "Serving {} at {}" root url) * :flush true)
+            (if open?
+              (webbrowser.open url))
+            (if (not reload?)
+              (try
+                (thread.join)
+                (catch KeyboardInterrupt error
+                  nil)
+                (finally
+                  (state.stop)
+                  (server.shutdown)
+                  (server.server_close)
+                  (thread.join 5.0)))
+              (try
+                (let [watcher
+                      (partial
+                        watch
+                        * :watch_filter filter
+                          :debounce 300
+                          :step 50
+                          :stop_event stop-event
+                          :rust_timeout 250
+                          :raise_interrupt true)]
+                  (doseq [pair
+                          (enumerate (apply watcher watch-roots) 2)]
+                    (let [number (nth pair 0)
+                          changes (nth pair 1)
+                          paths (changed-paths root changes)]
+                      (print
+                        (fmt "Changed: {}" (.join ", " paths))
+                        * :flush true)
+                      (let [generation
+                            (generation-root.joinpath
+                              (fmt "generation-{:06d}" number))
+                            result (build-generation root generation number)]
+                        (if (:ok result)
+                          (do
+                            (activate-generation state filter successful result)
+                            (report-success result false))
+                          (do
+                            (state.fail (:error result))
+                            (report-failure state result)))))))
+                (catch KeyboardInterrupt error
+                  nil)
+                (finally
+                  (stop-event.set)
+                  (state.stop)
+                  (server.shutdown)
+                  (server.server_close)
+                  (thread.join 5.0))))
+            (print "Development server stopped." * :flush true)
+            0))))))

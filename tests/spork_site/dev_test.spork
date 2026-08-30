@@ -1,0 +1,88 @@
+;; Structural tests for generation serving, filtering, and reload injection.
+(ns spork-site.dev-test
+  (:require
+    [spork-site.dev :as dev])
+  (:import
+    [os.path :refer [normcase realpath]]
+    [pathlib :refer [Path]]
+    [tempfile :refer [TemporaryDirectory]]))
+
+(deftest reload-client-is-injected-only-into-served-html
+  (def document (.encode "<html><body><h1>Hello</h1></body></html>" "utf-8"))
+  (def served (dev.inject-reload-client document true))
+  (assert (in (.encode "data-spork-site-reload" "utf-8") served))
+  (assert (< (.find served (.encode "data-spork-site-reload" "utf-8"))
+             (.find served (.encode "</body>" "utf-8"))))
+  (assert (= (dev.inject-reload-client document false) document))
+  (def fragment (.encode "<h1>Hello</h1>" "utf-8"))
+  (assert (.endswith (dev.inject-reload-client fragment true)
+                     dev.reload-client))
+  (assert (= (dev.display-host "0.0.0.0") "127.0.0.1"))
+  (assert (= (dev.display-host "::") "[::1]"))
+  (assert (= (dev.display-host "::1") "[::1]")))
+
+(deftest failed-builds-retain-the-last-successful-generation
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def first-generation (root.joinpath "generation-1"))
+    (def second-generation (root.joinpath "generation-2"))
+    (first-generation.mkdir)
+    (second-generation.mkdir)
+    (def state (dev.GenerationState true))
+    (assert (= (state.activate first-generation 1) 1))
+    (state.fail "intentional failure")
+    (def failed (state.snapshot))
+    (assert (= (nth failed 0) first-generation))
+    (assert (= (nth failed 1) 1))
+    (assert (= (nth failed 2) "intentional failure"))
+    (assert (= (nth failed 4) 1))
+    (assert (= (state.activate second-generation 2) 2))
+    (def recovered (state.snapshot))
+    (assert (= (nth recovered 0) second-generation))
+    (assert (= (nth recovered 1) 2))
+    (assert (= (nth recovered 2) nil))
+    (assert (= (nth recovered 4) 2))
+    (state.stop)
+    (assert (is (nth (state.snapshot) 3) true))))
+
+(deftest static-requests-are-canonical-and-cannot-traverse-generations
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def index (root.joinpath "index.html"))
+    (def docs (root.joinpath "docs"))
+    (def docs-index (docs.joinpath "index.html"))
+    (index.write_text "home" *{:encoding "utf-8"})
+    (docs.mkdir)
+    (docs-index.write_text "docs" *{:encoding "utf-8"})
+    (assert (= (:kind (dev.resolve-request root "/")) :file))
+    (assert (= (normcase (realpath (:path (dev.resolve-request root "/"))))
+               (normcase (realpath index))))
+    (assert (= (:kind (dev.resolve-request root "/docs")) :redirect))
+    (assert (= (:location (dev.resolve-request root "/docs")) "/docs/"))
+    (assert (= (:kind (dev.resolve-request root "/docs/")) :file))
+    (assert (= (:kind (dev.resolve-request root "/missing")) :missing))
+    (assert (= (:kind (dev.resolve-request root "/../../etc/passwd")) :invalid))
+    (assert (= (:kind (dev.resolve-request root "/%2e%2e/secret")) :invalid))
+    (assert (= (dev.content-type (root.joinpath "index.html"))
+               "text/html; charset=utf-8"))))
+
+(deftest watch-filter-includes-configured-inputs-and-ignores-artifacts
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def paths (dev.normalize-watch-paths root ["spork.it" "src" "content"]))
+    (def filter (dev.ProjectWatchFilter root paths))
+    (assert (filter nil (root.joinpath "spork.it")))
+    (assert (filter nil (root.joinpath "src" "example" "site.spork")))
+    (assert (filter nil (root.joinpath "content" "index.md")))
+    (assert (not (filter nil (root.joinpath "static" "site.css"))))
+    (assert (not (filter nil (root.joinpath ".venv" "package.py"))))
+    (filter.set-output (root.joinpath "content" "generated"))
+    (assert (not (filter nil (root.joinpath "content" "generated" "index.html"))))
+    (assert (= (dev.watch-path-values (dict)) dev.default-watch-paths))
+    (assert (= (dev.watch-path-values (dict [["watch" ["src"]]])) ["src"]))
+    (def unsafe
+      (try
+        (dev.normalize-watch-paths root ["../outside"])
+        false
+        (catch ValueError error true)))
+    (assert unsafe)))

@@ -17,6 +17,7 @@ Spork-native static site generation with immutable markup, structural Markdown, 
 - Pygments syntax highlighting over structural code nodes;
 - static asset discovery and copying;
 - deterministic full builds with safe output cleanup;
+- a full-rebuild development server with isolated generations and browser reload;
 - a project-local `spork site ...` command provider for source-only sites;
 - XML sitemap, RSS 2.0, and Atom 1.0 generation;
 - generic immutable post-order node transformations.
@@ -221,6 +222,7 @@ spork site check
 spork site routes
 spork site build
 spork site clean
+spork site serve
 ```
 
 `spork-site` loads `example.site:make-site` directly from configured source paths through the Spork command context. The site does not need an ahead-of-time build, a Python-importable adapter, a replacement application entry point, or manual virtualenv activation.
@@ -253,18 +255,42 @@ spork site build [--output PATH] [--no-clean] [--json]
 spork site check [--json]
 spork site clean [--output PATH]
 spork site routes [--json]
+spork site serve [--host HOST] [--port PORT] [--open] [--no-reload]
 spork site version
 ```
 
 `check` loads the source factory and constructs the complete rendered page, asset, conflict, and output plan without creating, cleaning, or writing the output directory. `routes` performs the same validation and reports canonical route/output pairs. `clean` uses the factory's configured output by default and applies the same project-root and filesystem-root protections as builds. `version` reports the selected provider version, Spork host version, command API, and project/active scope.
 
-The former built-module facade remains temporarily available for compatibility:
+## Development server
+
+Start the default development server from any directory below the project root:
 
 ```bash
-spork run --main spork-site.cli:main build example.site:site-config public
+spork site serve
+spork site serve --host 0.0.0.0 --port 8000 --open
 ```
 
-It is no longer the primary project workflow.
+Development mode performs correct full builds rather than mutating loaded source namespaces. The supervisor:
+
+1. launches each build in a fresh project `spork` process;
+2. writes it into a new temporary generation directory;
+3. switches HTTP serving only after that complete build succeeds;
+4. retains the last successful generation when a rebuild fails;
+5. broadcasts a server-sent reload event after successful rebuilds.
+
+HTML responses receive a small reload client while they are served. The generated files themselves are never modified, and `serve` does not write to the site's configured output directory. Static responses include an `X-Spork-Site-Generation` header for development inspection.
+
+The `:site :watch` vector controls watched project-relative files and directories:
+
+```clojure
+:site
+{:target "example.site:make-site"
+ :watch ["spork.it" "src" "content" "static"]}
+```
+
+When omitted, those four paths are the defaults. Related filesystem events are debounced into one rebuild. The configured output plus `.venv`, `.spork-out`, VCS metadata, Python caches, and common tool caches are ignored. If the first build fails, the reload-enabled server starts with a temporary error response and continues watching for a successful repair.
+
+Use `--open` to launch the development URL in the default browser. `--port 0` selects an available port. `--no-reload` builds and serves one immutable generation without watching, SSE, or HTML client injection. Stop either mode with Ctrl-C.
 
 ## Markup
 
@@ -352,7 +378,6 @@ The project requires Spork 0.6 in order to publish and exercise the command-prov
 spork sync --dev
 spork check
 spork test
-spork run version
 spork build --clean
 spork dist --clean
 ```
@@ -364,10 +389,11 @@ The test suite includes structural unit tests and an end-to-end documentation-an
 ```text
 src/spork_site/
 ├── build.spork        # deterministic output planning and execution
-├── cli.spork          # package-owned build/check/clean/routes/version CLI
+├── cli.spork          # package-owned build/check/clean/routes/serve/version CLI
 ├── collections.spork  # eager document filtering and sorting
 ├── content.spork      # front matter, discovery, and document loading
 ├── core.spork         # general public facade
+├── dev.spork          # generation server, watcher, workers, and browser reload
 ├── feeds.spork        # RSS and Atom
 ├── highlight.spork    # structural Pygments integration
 ├── markdown.spork     # CommonMark AST conversion

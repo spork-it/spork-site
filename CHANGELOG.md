@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-30
+
+### Added
+
+- Full-rebuild `spork site serve` development mode with a local static server, configured `watchfiles` inputs, debounced fresh-process build workers, atomic successful-generation switching, failed-build retention, SSE browser reload, optional browser opening, and one-build `--no-reload` serving.
+- Development generation timing, changed-path diagnostics, safe static path handling, cache-free responses, and generation response headers.
+
+### Removed
+
+- The built-module `spork run --main spork-site.cli:main` compatibility facade and its import-based site loading helpers. `spork site ...` is now the sole CLI integration.
+
 ## [0.1.0] - 2026-08-30
 
 ### Added
@@ -29,5 +40,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - Require Spork 0.6 for command-provider metadata and project source loading.
 - Make `spork site ...` the primary workflow while retaining the built-module `spork run` facade temporarily for compatibility.
 
-[Unreleased]: https://github.com/spork-it/spork-site/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/spork-it/spork-site/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/spork-it/spork-site/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/spork-it/spork-site/releases/tag/v0.1.0

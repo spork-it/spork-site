@@ -2,12 +2,10 @@
 (ns spork-site.build-test
   (:require
     [spork-site.build :as build]
-    [spork-site.cli :as cli]
     [spork-site.core :as site :refer [element markup]]
     [spork-site.routing :as routing])
   (:import
     [pathlib :refer [Path]]
-    [sys :as sys]
     [tempfile :refer [TemporaryDirectory]]))
 
 (defn raises? [expected-type function]
@@ -155,23 +153,6 @@
             (build.site
               * :pages [(routing.page "/docs/" (site.element :p "docs"))]
                 :assets [(build.asset source-a "docs")])))))))
-
-(deftest site-target-loading-and-cli-version-are-available
-  (with [directory (TemporaryDirectory)]
-    (def root (Path directory))
-    (def module-path (root.joinpath "fixture_loaded_site.py"))
-    (module-path.write-text
-      "site_config = {'loaded': True}\ndef make_site():\n    return site_config\n"
-      *{:encoding "utf-8"})
-    (sys.path.insert 0 (str root))
-    (try
-      (do
-        (assert (= (get (build.load-site "fixture_loaded_site:site_config") "loaded") true))
-        (assert (= (get (build.load-site "fixture_loaded_site:make_site") "loaded") true)))
-      (finally
-        (sys.path.pop 0))))
-  (assert (raises? ValueError (fn [] (build.load-site "missing-colon"))))
-  (assert (= (cli.main "version") 0)))
 
 (deftest unsafe-output-and-asset-paths-are-rejected
   (with [directory (TemporaryDirectory)]
