@@ -5,11 +5,13 @@
  :version "0.1.0"
  :description "Spork-native static site generation with immutable markup"
  :requires-python ">=3.10"
- :spork-version ">=0.5.3,<0.6"
+ :spork-version ">=0.6,<0.7"
 
  ;; Dependencies (pip-style specifications)
- :dependencies ["markdown-it-py>=4,<5"]
- :dev-dependencies ["twine>=5"]
+ :dependencies ["markdown-it-py>=4,<5"
+                "python-frontmatter>=1.1,<2"
+                "Pygments>=2.18,<3"]
+ :dev-dependencies ["pytest>=8,<9" "twine>=5"]
 
  ;; Source code locations
  :source-paths ["src"]
@@ -38,5 +40,10 @@
         :Issues "https://github.com/spork-it/spork-site/issues"
         :Changelog "https://github.com/spork-it/spork-site/blob/main/CHANGELOG.md"}
 
- ;; Entry point for 'spork run'
- :main "spork-site.core:main"}
+ ;; Legacy entry point for 'spork run'; consumers use the provider below.
+ :main "spork-site.cli:main"
+
+ ;; Complete package-owned CLI exposed as `spork site ...`.
+ :commands
+ {"site" {:main "spork-site.cli:command"
+           :description "Build and serve Spork static sites"}}}

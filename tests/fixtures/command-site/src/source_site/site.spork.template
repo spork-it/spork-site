@@ -1,0 +1,25 @@
+(ns source-site.site
+  (:require
+    [spork-site.build :as build]
+    [spork-site.content :as content]
+    [spork-site.core :refer [element markup]]
+    [spork-site.routing :as routing]))
+
+(defn document-page [document]
+  (markup
+    ($html {:lang "en"}
+      ($head
+        ($meta {:charset "utf-8"})
+        ($title (:title document))
+        ($link {:rel "stylesheet" :href "/site.css"}))
+      ($body
+        ($main
+          ($h1 (:title document))
+          (:content document))))))
+
+(defn make-site []
+  (let [documents (content.load-documents "content")]
+    (build.site
+      * :output "public"
+        :pages (routing.pages-for documents document-page)
+        :assets (build.discover-assets "static"))))

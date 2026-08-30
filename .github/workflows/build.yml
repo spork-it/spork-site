@@ -28,7 +28,7 @@ jobs:
       - name: Install build toolchain
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "spork-lang==0.5.3" twine
+          python -m pip install "spork-lang==0.6.0" twine
 
       - name: Verify tag and manifest versions match
         env:
@@ -59,14 +59,16 @@ jobs:
       - name: Verify wheel payload and dependencies
         run: |
           python - <<'PY'
+          from configparser import ConfigParser
           from email import message_from_bytes
           from pathlib import Path
           from zipfile import ZipFile
 
           from packaging.requirements import Requirement
+          from packaging.utils import canonicalize_name
 
           wheel = next(Path("dist").glob("*.whl"))
-          modules = {"core", "markdown", "markup", "nodes", "render", "transforms"}
+          modules = {path.stem for path in Path("src/spork_site").glob("*.spork")}
           required = {"spork_site/__init__.py"}
           for module in modules:
               required.update(
@@ -83,16 +85,35 @@ jobs:
               metadata_name = next(
                   name for name in names if name.endswith(".dist-info/METADATA")
               )
+              entry_points_name = next(
+                  name for name in names if name.endswith(".dist-info/entry_points.txt")
+              )
               metadata = message_from_bytes(archive.read(metadata_name))
+              entry_points = ConfigParser()
+              entry_points.read_string(archive.read(entry_points_name).decode("utf-8"))
 
           if missing:
               raise SystemExit(f"wheel is missing: {sorted(missing)}")
+          if dict(entry_points["spork.commands.v1"]) != {
+              "site": "spork_site.cli:command"
+          }:
+              raise SystemExit(
+                  f"unexpected command entry points: {dict(entry_points['spork.commands.v1'])}"
+              )
 
           dependency_names = {
-              Requirement(value).name
+              canonicalize_name(Requirement(value).name)
               for value in metadata.get_all("Requires-Dist", [])
           }
-          expected = {"spork-runtime", "markdown-it-py"}
+          expected = {
+              canonicalize_name(name)
+              for name in (
+                  "spork-runtime",
+                  "markdown-it-py",
+                  "python-frontmatter",
+                  "Pygments",
+              )
+          }
           if not expected.issubset(dependency_names):
               raise SystemExit(
                   f"wheel dependencies {sorted(dependency_names)} do not include "
@@ -146,6 +167,8 @@ jobs:
 
           assert version("spork-runtime")
           assert version("markdown-it-py")
+          assert version("python-frontmatter")
+          assert version("Pygments")
           try:
               version("spork-lang")
           except PackageNotFoundError:
@@ -158,10 +181,14 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           python - <<'PY'
+          from spork.runtime.types import Keyword
+          from spork_site.content import parse_front_matter
           from spork_site.markdown import render
           from spork_site.nodes import Element, Fragment
           from spork_site.render import render_html
 
+          parsed = parse_front_matter("---\ntitle: Hello\n---\nBody\n")
+          assert parsed[Keyword("metadata")][Keyword("title")] == "Hello"
           document = render("# Hello\n\nBuilt with **Spork**.\n")
           assert isinstance(document, Fragment)
           assert isinstance(document.children[0], Element)
@@ -171,7 +198,13 @@ jobs:
           PY
 
       - name: Install Spork
-        run: python -m pip install "spork-lang==0.5.3"
+        run: python -m pip install "spork-lang==0.6.0"
+
+      - name: Smoke-test installed command provider
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m spork site version
+          python -m spork site --help
 
       - name: Smoke-test installed Spork source discovery
         working-directory: ${{ runner.temp }}
@@ -208,9 +241,11 @@ jobs:
       - name: Smoke-test installed sdist
         working-directory: ${{ runner.temp }}
         run: >-
-          python -c "from spork_site.markdown import render;
+          python -c "from spork_site.content import parse_front_matter;
+          from spork_site.markdown import render;
           from spork_site.render import render_html;
-          assert render_html(render('Hello')) == '<p>Hello</p>'"
+          assert render_html(render('Hello')) == '<p>Hello</p>';
+          assert 'Body' in str(parse_front_matter('Body'))"
 
   publish:
     name: Publish to PyPI

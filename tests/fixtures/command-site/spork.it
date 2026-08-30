@@ -1,0 +1,15 @@
+{:name "source-site-fixture"
+ :version "0.1.0"
+ :description "Source-only consumer for the spork-site command provider"
+ :requires-python ">=3.10"
+ :spork-version ">=0.6,<0.7"
+ :dependencies ["__SPORK_SITE_REQUIREMENT__"]
+ :source-paths ["src"]
+ :test-paths []
+
+ ;; This application entry point remains unrelated to site generation.
+ :main "source-site.app:main"
+
+ :site
+ {:target "source-site.site:make-site"
+  :watch ["spork.it" "src" "content" "static"]}}

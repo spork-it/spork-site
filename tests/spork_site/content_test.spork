@@ -1,0 +1,115 @@
+;; Tests for front matter, discovery, collections, and syntax highlighting.
+(ns spork-site.content-test
+  (:require
+    [spork-site.collections :as collections]
+    [spork-site.content :as content]
+    [spork-site.core :as site]
+    [spork-site.highlight :as highlight]
+    [spork-site.markdown :as markdown])
+  (:import
+    [pathlib :refer [Path]]
+    [tempfile :refer [TemporaryDirectory]]))
+
+(defn raises? [expected-type function]
+  (try
+    (do (function) false)
+    (catch Exception error
+      (isinstance error expected-type))))
+
+(defn published? [document]
+  (not (is (:draft document) true)))
+
+(deftest front-matter-becomes-persistent-keyword-data
+  (def parsed
+    (content.parse-front-matter
+      "---\ntitle: Hello\ntags: [spork, docs]\nnested:\n  ready: true\ndate: 2026-08-30\n---\n# Body\n"))
+  (assert (= (:title (:metadata parsed)) "Hello"))
+  (assert (= (:tags (:metadata parsed)) ["spork" "docs"]))
+  (assert (= (:ready (:nested (:metadata parsed))) true))
+  (assert (= (str (:date (:metadata parsed))) "2026-08-30"))
+  (assert (= (:body parsed) "# Body"))
+  (def plain (content.parse-front-matter "No metadata.\n"))
+  (assert (= (:metadata plain) {}))
+  (assert (= (:body plain) "No metadata."))
+  (assert (raises? TypeError (fn [] (content.parse-front-matter 42))))
+  (assert (raises? TypeError (fn [] (content.persistent-data #{"unordered"})))))
+
+(deftest discovery-is-recursive-deduplicated-and-deterministic
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (.mkdir (root.joinpath "z"))
+    (.mkdir (root.joinpath "a"))
+    (.write-text (root.joinpath "z" "last.md") "Last" *{:encoding "utf-8"})
+    (.write-text (root.joinpath "a" "first.md") "First" *{:encoding "utf-8"})
+    (.write-text (root.joinpath "ignore.txt") "Ignore" *{:encoding "utf-8"})
+    (def paths
+      (content.discover-markdown root
+        *{:patterns ["**/*.md" "a/*.md"]}))
+    (assert (= (mapv (fn [path] (.as-posix (path.relative-to root))) paths)
+               ["a/first.md" "z/last.md"]))
+    (assert (raises? ValueError
+                     (fn [] (content.discover-markdown (root.joinpath "missing")))))
+    (assert (raises? ValueError
+                     (fn []
+                       (content.discover-markdown root *{:patterns ["../*.md"]}))))))
+
+(deftest loaded-documents-have-derived-and-explicit-routes
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (.mkdir (root.joinpath "guides"))
+    (.write-text (root.joinpath "index.md")
+      "---\ntitle: Home\n---\n# Welcome\n" *{:encoding "utf-8"})
+    (.write-text (root.joinpath "guides" "install.md")
+      "---\ntitle: Install\nslug: setup\ntags: [docs]\n---\nUse Spork.\n"
+      *{:encoding "utf-8"})
+    (.write-text (root.joinpath "guides" "custom.md")
+      "---\ntitle: Custom\npermalink: /handbook/custom.html\n---\nCustom.\n"
+      *{:encoding "utf-8"})
+    (def documents (content.load-documents root *{:highlight? false}))
+    (assert (= (mapv :relative-path documents)
+               ["guides/custom.md" "guides/install.md" "index.md"]))
+    (assert (= (mapv :route documents)
+               ["/handbook/custom.html" "/guides/setup/" "/"]))
+    (def install (nth documents 1))
+    (assert (= (:title install) "Install"))
+    (assert (= (:metadata install) {:title "Install" :slug "setup" :tags ["docs"]}))
+    (assert (isinstance (:content install) site.Fragment))
+    (assert (= (site.render-html (:content install)) "<p>Use Spork.</p>"))))
+
+(deftest fenced-code-can-be-highlighted-structurally
+  (def original (markdown.render "```python\nprint('<tag>')\n```\n"))
+  (def result (highlight.highlight-syntax original))
+  (def pre (first result.children))
+  (def code (first pre.children))
+  (assert (= (get code.attrs "class") "language-python highlight"))
+  (assert (isinstance (first code.children) site.RawHtml))
+  (assert (in "class=\"nb\"" (site.render-html result)))
+  (assert (in "&lt;tag&gt;" (site.render-html result)))
+  (def unknown (highlight.highlight-syntax
+                 (markdown.render "```not-a-real-lexer\nvalue\n```\n")))
+  (assert (= (site.render-html unknown)
+             "<pre><code class=\"language-not-a-real-lexer\">value\n</code></pre>"))
+  (def spork-code
+    (highlight.highlight-syntax
+      (markdown.render "```spork\n(def answer 42)\n```\n")))
+  (assert (= (get (. (first (. (first spork-code.children) children)) attrs) "class")
+             "language-spork highlight"))
+  (assert (isinstance
+            (first (. (first (. (first spork-code.children) children)) children))
+            site.RawHtml)))
+
+(deftest collections-filter-sort-and-limit-with-ordinary-functions
+  (def documents
+    [{:title "Older" :date "2025-01-01" :draft false}
+     {:title "Draft" :date "2027-01-01" :draft true}
+     {:title "Newer" :date "2026-01-01" :draft false}])
+  (def posts
+    (collections.collection documents
+      * :where published? :sort-by :date :order :desc :limit 1))
+  (assert (= posts [{:title "Newer" :date "2026-01-01" :draft false}]))
+  (assert (isinstance posts Vector))
+  (assert (raises? ValueError
+                   (fn [] (collections.collection documents *{:limit -1}))))
+  (assert (raises? ValueError
+                   (fn [] (collections.collection documents
+                            * :sort-by :date :order :sideways)))))

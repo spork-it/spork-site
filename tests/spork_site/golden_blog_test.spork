@@ -1,0 +1,89 @@
+;; End-to-end fixture proving docs and a blog build with public APIs only.
+(ns spork-site.golden-blog-test
+  (:require
+    [spork-site.build :as build]
+    [spork-site.collections :as collections]
+    [spork-site.content :as content]
+    [spork-site.core :as site :refer [element markup]]
+    [spork-site.feeds :as feeds]
+    [spork-site.routing :as routing]
+    [spork-site.sitemap :as sitemap])
+  (:import
+    [pathlib :refer [Path]]
+    [tempfile :refer [TemporaryDirectory]]))
+
+(defn published? [document]
+  (not (is (:draft document) true)))
+
+(defn post? [document]
+  (= (:kind document) "post"))
+
+(defn blog-document [document]
+  (markup
+    ($html {:lang "en"}
+      ($head
+        ($meta {:charset "utf-8"})
+        ($title (:title document))
+        ($link {:rel "stylesheet" :href "/site.css"}))
+      ($body
+        ($main {:class "content"}
+          ($h1 (:title document))
+          (:content document))))))
+
+(deftest fixture-site-builds-docs-blog-assets-sitemap-and-feeds
+  (with [directory (TemporaryDirectory)]
+    (def fixture (Path "tests/fixtures/blog"))
+    (def output (.joinpath (Path directory) "public"))
+    (def documents (content.load-documents (fixture.joinpath "content")))
+    (def published
+      (collections.collection documents
+        *{:where published? :sort-by :route :order :asc}))
+    (def posts
+      (collections.collection published
+        * :where post? :sort-by :date :order :desc))
+    (def feed-config
+      {:title "Spork Notes"
+       :description "Fixture blog"
+       :url "https://example.test"
+       :author "Spork"})
+    (def config
+      (build.site
+        * :output output
+          :pages [(routing.pages-for published blog-document)
+                  (routing.output-file "/sitemap.xml"
+                    (sitemap.sitemap "https://example.test" published))
+                  (routing.output-file "/feed.xml"
+                    (feeds.rss feed-config posts))
+                  (routing.output-file "/atom.xml"
+                    (feeds.atom feed-config posts))]
+          :assets (build.discover-assets (fixture.joinpath "static"))))
+    (def summary (build.build-site config))
+    (assert (= (:written summary)
+               ["atom.xml" "docs/index.html" "docs/install/index.html"
+                "feed.xml" "index.html" "posts/first/index.html"
+                "posts/second/index.html" "site.css" "sitemap.xml"]))
+    (assert (= (:pages summary) 8))
+    (assert (= (:assets summary) 1))
+    (assert (= (.read-text (output.joinpath "index.html") *{:encoding "utf-8"})
+               "<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Spork Notes</title><link href=\"/site.css\" rel=\"stylesheet\"></head><body><main class=\"content\"><h1>Spork Notes</h1><p>Welcome to <strong>Spork Notes</strong>.</p></main></body></html>"))
+    (assert (in "<h1>Installation</h1><p>Run <code>spork sync</code>.</p>"
+                (.read-text (output.joinpath "docs" "install" "index.html")
+                            *{:encoding "utf-8"})))
+    (def first-html
+      (.read-text (output.joinpath "posts" "first" "index.html")
+                  *{:encoding "utf-8"}))
+    (assert (in "<h1>First Post</h1><h2>Hello</h2>" first-html))
+    (assert (in "<code class=\"language-python highlight\">" first-html))
+    (assert (in "class=\"nb\">print</span>" first-html))
+    (assert (not (.exists (output.joinpath "posts" "draft" "index.html"))))
+    (assert (= (.read-text (output.joinpath "site.css") *{:encoding "utf-8"})
+               "body { color: #222; }\n"))
+    (def rss-output (.read-text (output.joinpath "feed.xml") *{:encoding "utf-8"}))
+    (assert (< (.index rss-output "Second Post") (.index rss-output "First Post")))
+    (assert (not (in "Hidden Draft" rss-output)))
+    (def first-build (for [path (:written summary)]
+                       (.read-bytes (apply output.joinpath (. (Path path) parts)))))
+    (def second-summary (build.build-site config))
+    (def second-build (for [path (:written second-summary)]
+                        (.read-bytes (apply output.joinpath (. (Path path) parts)))))
+    (assert (= first-build second-build))))

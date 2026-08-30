@@ -1,0 +1,153 @@
+;; Markdown content discovery, front matter, and immutable document values.
+(ns spork-site.content
+  (:require
+    [spork-site.highlight :refer [highlight-syntax]]
+    [spork-site.markdown :as markdown]
+    [spork-site.nodes :refer [sequence-value?]]
+    [spork-site.routing :refer [normalize-route]])
+  (:import
+    [collections.abc :refer [Mapping Set :as AbstractSet]]
+    [frontmatter :as frontmatter-lib]
+    [pathlib :refer [Path PurePosixPath]]
+    [re :as re]))
+
+(def slug-pattern (re.compile "^[A-Za-z0-9][A-Za-z0-9._~-]*$"))
+(def default-patterns ["**/*.md"])
+
+(defn metadata-key [key]
+  (if (isinstance key str) (Keyword key) key))
+
+(defn persistent-data [value]
+  "Recursively convert Python front-matter containers to persistent values."
+  (cond
+    (isinstance value Mapping)
+      (reduce
+        (fn [result pair]
+          (assoc result
+                 (metadata-key (nth pair 0))
+                 (persistent-data (nth pair 1))))
+        {}
+        (value.items))
+    (isinstance value AbstractSet)
+      (throw (TypeError "front matter sets are not deterministic"))
+    (sequence-value? value)
+      (into [] (map persistent-data value))
+    :else value))
+
+(defn parse-front-matter [source]
+  "Parse optional YAML front matter into {:metadata ... :body ...}."
+  (if (not (isinstance source str))
+    (throw (TypeError "document source must be a string")))
+  (let [post (frontmatter-lib.loads source)]
+    {:metadata (persistent-data post.metadata)
+     :body post.content}))
+
+(defn validate-slug [slug]
+  (if (not (isinstance slug str))
+    (throw (TypeError "document slug must be a string")))
+  (if (not (slug-pattern.fullmatch slug))
+    (throw (ValueError (fmt "invalid document slug: {}" (repr slug)))))
+  slug)
+
+(defn route-from-relative [relative-path slug]
+  (let [without-suffix (relative-path.with-suffix "")
+        path-parts (into [] without-suffix.parts)
+        output-parts
+          (if (= (.lower relative-path.stem) "index")
+            (into [] (butlast path-parts))
+            (conj (into [] (butlast path-parts)) slug))
+        joined (.join "/" output-parts)]
+    (if (= joined "") "/" (normalize-route (+ "/" joined "/")))))
+
+(defn document-route [relative-path metadata slug]
+  "Use explicit front-matter routing or derive a clean route from the path."
+  (let [explicit (or (get metadata :route)
+                     (get metadata :permalink)
+                     (get metadata :url))]
+    (if (= explicit nil)
+      (route-from-relative relative-path slug)
+      (normalize-route explicit))))
+
+(defn document-value [source-path relative-path parsed parser highlight?]
+  (let [metadata (:metadata parsed)
+        body (:body parsed)
+        requested-slug (get metadata :slug)
+        slug (validate-slug
+               (if (= requested-slug nil)
+                 relative-path.stem
+                 (str requested-slug)))
+        content (markdown.render-with parser body)
+        rendered (if highlight? (highlight-syntax content) content)
+        route (document-route relative-path metadata slug)
+        base (into {} (metadata.items))]
+    (-> base
+        (assoc :source-path source-path)
+        (assoc :relative-path (relative-path.as-posix))
+        (assoc :id (.as-posix (relative-path.with-suffix "")))
+        (assoc :slug slug)
+        (assoc :route route)
+        (assoc :metadata metadata)
+        (assoc :body body)
+        (assoc :content rendered))))
+
+(defn load-markdown [path * (root nil) (parser markdown.default-parser) (highlight? true)]
+  "Load one UTF-8 Markdown document with front matter and structural content."
+  (let [source-path (Path path)
+        root-path (if (= root nil) source-path.parent (Path root))
+        relative-path
+          (try
+            (source-path.relative-to root-path)
+            (catch ValueError error
+              (throw
+                (ValueError
+                  (fmt "document {} is outside content root {}"
+                       source-path root-path)))))
+        source (source-path.read-text *{:encoding "utf-8"})
+        parsed (parse-front-matter source)]
+    (document-value source-path relative-path parsed parser (bool highlight?))))
+
+(defn parent-pattern-part? [part]
+  (= part ".."))
+
+(defn validate-pattern [pattern]
+  (if (not (isinstance pattern str))
+    (throw (TypeError "content glob patterns must be strings")))
+  (let [path (PurePosixPath pattern)]
+    (if (or (= pattern "") (in "\\" pattern) (path.is-absolute)
+            (some parent-pattern-part? path.parts))
+      (throw (ValueError (fmt "invalid content glob pattern: {}" (repr pattern)))))
+    pattern))
+
+(defn discover-markdown [root * (patterns default-patterns)]
+  "Discover matching Markdown paths in deterministic relative-path order."
+  (let [root-path (Path root)]
+    (if (not (root-path.is-dir))
+      (throw (ValueError (fmt "content root is not a directory: {}" root-path))))
+    (if (not (sequence-value? patterns))
+      (throw (TypeError "content patterns must be a deterministic sequence")))
+    (let [found
+          (reduce
+            (fn [result pattern]
+              (let [safe-pattern (validate-pattern pattern)]
+                (reduce
+                  (fn [entries path]
+                  (if (path.is-file)
+                    (assoc entries (.as-posix (path.relative-to root-path)) path)
+                    entries))
+                  result
+                  (root-path.glob safe-pattern))))
+            {}
+            patterns)]
+      (into []
+            (map (fn [pair] (nth pair 1))
+                 (sorted (found.items) *{:key first}))))))
+
+(defn load-documents [root * (patterns default-patterns)
+                              (parser markdown.default-parser)
+                              (highlight? true)]
+  "Discover and load Markdown documents into a persistent vector."
+  (let [root-path (Path root)]
+    (for [path (discover-markdown root-path *{:patterns patterns})]
+      (load-markdown path *{:root root-path
+                            :parser parser
+                            :highlight? highlight?}))))

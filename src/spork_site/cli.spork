@@ -1,0 +1,253 @@
+;; Package-owned `spork site ...` command provider and legacy CLI facade.
+(ns spork-site.cli
+  (:require
+    [spork-site.build :as build])
+  (:import
+    [argparse :refer [ArgumentParser]]
+    [builtins :refer [dict list]]
+    [collections.abc :refer [Mapping]]
+    [importlib.metadata :as metadata]
+    [json :refer [dumps]]
+    [os :refer [chdir]]
+    [pathlib :refer [Path]]
+    [sys :as sys]
+    [time :refer [perf_counter]]))
+
+(def version-string "0.1.0")
+
+(def legacy-usage
+  "Usage:\n  spork run build MODULE:ATTRIBUTE [OUTPUT]\n  spork run clean [OUTPUT]\n  spork run version")
+
+(defn print-summary [summary]
+  (print
+    (fmt "Built {} pages and {} assets in {}"
+         (:pages summary) (:assets summary) (:output summary))))
+
+(defn ^int main [& args]
+  "Compatibility facade for the former `spork run` workflow."
+  (if (= (count args) 0)
+    (do (print legacy-usage) 2)
+    (let [action (first args)]
+      (cond
+        (= action "version")
+          (do (print version-string) 0)
+        (= action "build")
+          (if (or (< (count args) 2) (> (count args) 3))
+            (do (print legacy-usage) 2)
+            (let [summary (if (= (count args) 3)
+                            (build.build-target (nth args 1) (nth args 2))
+                            (build.build-target (nth args 1)))]
+              (print-summary summary)
+              0))
+        (= action "clean")
+          (if (> (count args) 2)
+            (do (print legacy-usage) 2)
+            (do
+              (build.clean-site (if (= (count args) 2) (nth args 1) "dist"))
+              0))
+        :else (do (print legacy-usage) 2)))))
+
+(defn make-parser []
+  (let [parser
+          (ArgumentParser
+            * :prog "spork site"
+              :description "Build deterministic static sites from Spork source")
+        commands
+          (parser.add_subparsers
+            * :dest "action" :metavar "COMMAND" :required true)
+        build-parser
+          (commands.add_parser
+            "build" * :help "validate and write the complete site"
+                      :description "Validate and write the complete site")
+        check-parser
+          (commands.add_parser
+            "check" * :help "validate the complete site without writing"
+                      :description "Validate the complete site without writing")
+        clean-parser
+          (commands.add_parser
+            "clean" * :help "remove the configured output safely"
+                      :description "Remove the configured output safely")
+        routes-parser
+          (commands.add_parser
+            "routes" * :help "list canonical routes and output paths"
+                       :description "List canonical routes and output paths")]
+    (build-parser.add_argument
+      "--output" * :metavar "PATH" :help "override the configured output directory")
+    (build-parser.add_argument
+      "--no-clean" * :dest "no_clean" :action "store_true"
+                     :help "retain unrelated files in the output directory")
+    (build-parser.add_argument
+      "--json" * :dest "json_output" :action "store_true"
+                 :help "write a machine-readable build summary")
+    (check-parser.add_argument
+      "--json" * :dest "json_output" :action "store_true"
+                 :help "write a machine-readable validation summary")
+    (clean-parser.add_argument
+      "--output" * :metavar "PATH" :help "override the configured output directory")
+    (routes-parser.add_argument
+      "--json" * :dest "json_output" :action "store_true"
+                 :help "write routes as JSON")
+    (commands.add_parser
+      "version" * :help "show provider and Spork host versions"
+                  :description "Show provider and Spork host versions")
+    parser))
+
+(defn print-json [value]
+  (print (dumps value * :indent 2 :sort_keys true)))
+
+(defn configuration-error [message]
+  (print (+ "Error: " message) * :file sys.stderr)
+  nil)
+
+(defn load-project-site [context]
+  "Load and call the configured source-only site factory."
+  (let [project (context.require-project)
+        settings (project.get-plugin-config "site")]
+    (cond
+      (= settings nil)
+        (configuration-error
+          "spork.it must define :site {:target \"namespace:factory\"}")
+      (not (isinstance settings Mapping))
+        (configuration-error ":site must be a map")
+      :else
+        (let [target (get settings "target")]
+          (cond
+            (or (not (isinstance target str)) (= (.strip target) ""))
+              (configuration-error ":site :target must be a non-empty namespace:function string")
+            :else
+              (let [factory (context.load-entry target)]
+                (cond
+                  (not (callable factory))
+                    (configuration-error
+                      (fmt ":site target {} must resolve to a callable factory" (repr target)))
+                  :else
+                    (let [site-value (factory)]
+                      (if (not (isinstance site-value Mapping))
+                        (configuration-error
+                          (fmt ":site target {} must return a site map" (repr target)))
+                        site-value)))))))))
+
+(defn with-project-root [context function]
+  "Run one operation from the manifest root and always restore the caller cwd."
+  (context.require-project)
+  (let [previous (Path.cwd)
+        root (Path context.project-root)]
+    (chdir root)
+    (try
+      (function)
+      (finally
+        (chdir previous)))))
+
+(defn with-configured-site [context operation]
+  (with-project-root
+    context
+    (fn []
+      (let [site-value (load-project-site context)]
+        (if (= site-value nil)
+          1
+          (operation site-value))))))
+
+(defn source-build-operation [context name]
+  "Load a library operation through the consumer's source runtime.
+
+  The site factory may construct nodes from installed .spork sources while this
+  provider module is compiled Python. Loading operations through the same
+  context keeps node classes and namespace state shared across that boundary."
+  (context.load-entry (+ "spork-site.build:" name)))
+
+(defn build-payload [summary duration]
+  (dict
+    [["assets" (:assets summary)]
+     ["duration_seconds" (round duration 6)]
+     ["output" (str (:output summary))]
+     ["pages" (:pages summary)]
+     ["written" (list (:written summary))]]))
+
+(defn run-build [context arguments]
+  (with-configured-site
+    context
+    (fn [site-value]
+      (let [started (perf_counter)
+            clean-override (if arguments.no_clean false nil)
+            build-site (source-build-operation context "build-site")
+            summary (build-site site-value arguments.output clean-override)
+            duration (- (perf_counter) started)]
+        (if arguments.json_output
+          (print-json (build-payload summary duration))
+          (print
+            (fmt "Built {} pages and {} assets in {:.3f}s -> {}"
+                 (:pages summary) (:assets summary) duration (:output summary))))
+        0))))
+
+(defn check-payload [summary]
+  (dict
+    [["assets" (:assets summary)]
+     ["files" (count (:plan summary))]
+     ["output" (str (:output summary))]
+     ["pages" (:pages summary)]]))
+
+(defn run-check [context arguments]
+  (with-configured-site
+    context
+    (fn [site-value]
+      (let [check-site (source-build-operation context "check-site")
+            summary (check-site site-value)]
+        (if arguments.json_output
+          (print-json (check-payload summary))
+          (print
+            (fmt "Checked {} pages and {} assets -> {}"
+                 (:pages summary) (:assets summary) (:output summary))))
+        0))))
+
+(defn configured-output [site-value override]
+  (if (= override nil) (get site-value :output "dist") override))
+
+(defn run-clean [context arguments]
+  (with-configured-site
+    context
+    (fn [site-value]
+      (let [output (configured-output site-value arguments.output)
+            clean-site (source-build-operation context "clean-site")
+            root (clean-site output)]
+        (print (fmt "Cleaned {}" root))
+        0))))
+
+(defn routes-payload [routes]
+  (list
+    (for [route routes]
+      (dict [["output" (:output route)]
+             ["route" (:route route)]]))))
+
+(defn run-routes [context arguments]
+  (with-configured-site
+    context
+    (fn [site-value]
+      (let [site-routes (source-build-operation context "site-routes")
+            routes (site-routes site-value)]
+        (if arguments.json_output
+          (print-json (routes-payload routes))
+          (if (= (count routes) 0)
+            (print "No routes.")
+            (doseq [route routes]
+              (print (fmt "{}\t{}" (:route route) (:output route))))))
+        0))))
+
+(defn run-version [context]
+  (let [provider-version (or context.provider.version version-string)
+        host-version (metadata.version "spork-lang")]
+    (print
+      (fmt "spork-site {}\nSpork host: {}\nCommand API: v{}\nProvider: {} ({})"
+           provider-version host-version context.api-version
+           context.provider.name context.scope))
+    0))
+
+(defn ^int command [context argv]
+  "Run the package-owned nested CLI with exact post-`site` arguments."
+  (let [arguments (.parse_args (make-parser) argv)]
+    (cond
+      (= arguments.action "build") (run-build context arguments)
+      (= arguments.action "check") (run-check context arguments)
+      (= arguments.action "clean") (run-clean context arguments)
+      (= arguments.action "routes") (run-routes context arguments)
+      (= arguments.action "version") (run-version context)
+      :else 2)))

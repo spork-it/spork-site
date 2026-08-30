@@ -1,0 +1,79 @@
+;; Tests for nested provider parsing and context-based source site loading.
+(ns spork-site.cli-test
+  (:require
+    [spork-site.build :as build]
+    [spork-site.cli :as cli]
+    [spork-site.core :as site]
+    [spork-site.routing :as routing])
+  (:import
+    [contextlib :refer [redirect_stderr redirect_stdout]]
+    [io :refer [StringIO]]
+    [json :refer [loads]]
+    [pathlib :refer [Path]]
+    [tempfile :refer [TemporaryDirectory]]
+    [types :refer [SimpleNamespace]]))
+
+(defn fake-context [root settings factory]
+  (let [project (SimpleNamespace)
+        provider (SimpleNamespace * :name "spork-site" :version "0.1.0")
+        context (SimpleNamespace * :project_root root :provider provider
+                                  :api_version 1 :scope "project")]
+    (set! project.get_plugin_config (fn [name] settings))
+    (set! context.require_project (fn [] project))
+    (set! context.load_entry
+      (fn [target]
+        (cond
+          (= target "fixture.site:make-site") factory
+          (= target "spork-site.build:build-site") build.build-site
+          (= target "spork-site.build:check-site") build.check-site
+          (= target "spork-site.build:clean-site") build.clean-site
+          (= target "spork-site.build:site-routes") build.site-routes
+          :else nil)))
+    context))
+
+(deftest nested-parser-owns-site-specific-options
+  (def arguments
+    (.parse_args (cli.make-parser)
+                 ["build" "--output" "preview" "--no-clean" "--json"]))
+  (assert (= arguments.action "build"))
+  (assert (= arguments.output "preview"))
+  (assert (is arguments.no_clean true))
+  (assert (is arguments.json_output true))
+  (def routes (.parse_args (cli.make-parser) ["routes" "--json"]))
+  (assert (= routes.action "routes"))
+  (assert (is routes.json_output true)))
+
+(deftest check-and-routes-load-source-factory-without-writing
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def output (root.joinpath "public"))
+    (def factory
+      (fn []
+        (build.site
+          * :output "public"
+            :pages [(routing.page "/" (site.element :p "Home"))])))
+    (def context (fake-context root {"target" "fixture.site:make-site"} factory))
+    (def check-stream (StringIO))
+    (with [capture (redirect_stdout check-stream)]
+      (assert (= (cli.command context ["check" "--json"]) 0)))
+    (def checked (loads (check-stream.getvalue)))
+    (assert (= (get checked "pages") 1))
+    (assert (= (get checked "assets") 0))
+    (assert (= (get checked "output") (str (.resolve output))))
+    (assert (not (output.exists)))
+    (def routes-stream (StringIO))
+    (with [capture (redirect_stdout routes-stream)]
+      (assert (= (cli.command context ["routes" "--json"]) 0)))
+    (def routes (loads (routes-stream.getvalue)))
+    (assert (= (count routes) 1))
+    (assert (= (get (first routes) "output") "index.html"))
+    (assert (= (get (first routes) "route") "/"))
+    (assert (not (output.exists)))))
+
+(deftest missing-site-configuration-is-an-expected-command-failure
+  (with [directory (TemporaryDirectory)]
+    (def context (fake-context (Path directory) nil (fn [] nil)))
+    (def errors (StringIO))
+    (with [capture (redirect_stderr errors)]
+      (assert (= (cli.command context ["check"]) 1)))
+    (assert (in "spork.it must define :site" (errors.getvalue)))))

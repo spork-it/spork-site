@@ -2,41 +2,279 @@
 
 [![Tests](https://github.com/spork-it/spork-site/actions/workflows/test.yml/badge.svg)](https://github.com/spork-it/spork-site/actions/workflows/test.yml)
 
-Spork-native static site generation with immutable markup and structural Markdown.
+Spork-native static site generation with immutable markup, structural Markdown, and deterministic content builds.
 
-## Current capabilities
-
-Implemented and tested:
+## Capabilities
 
 - immutable `Element`, `Fragment`, `Text`, and `RawHtml` nodes;
-- recursive child and fragment flattening;
-- scalar-to-text conversion and `nil` omission;
-- explicit `element`, `fragment`, `text`, and `raw-html` constructors;
 - locally scoped `(markup ...)` blocks with `$tag` lowering;
-- normalized classes, styles, attributes, custom tags, and void elements;
 - deterministic, escaped HTML serialization;
-- CommonMark parsing through `markdown-it-py`;
-- Markdown AST conversion into the same immutable node model;
-- structural headings, paragraphs, links, images, lists, quotes, and code;
-- explicit `RawHtml` nodes for Markdown inline and block HTML;
-- direct composition of Markdown, authored markup, components, and sequences;
+- CommonMark AST conversion into the shared node model;
+- YAML front matter and recursive Markdown discovery;
+- eager persistent filtering, sorting, and limiting of content collections;
+- generated clean routes and duplicate/conflicting output detection;
+- ordinary functions for components and layouts;
+- Pygments syntax highlighting over structural code nodes;
+- static asset discovery and copying;
+- deterministic full builds with safe output cleanup;
+- a project-local `spork site ...` command provider for source-only sites;
+- XML sitemap, RSS 2.0, and Atom 1.0 generation;
 - generic immutable post-order node transformations.
 
-Site loading and the static build pipeline are not yet implemented.
+## Content-driven site
+
+Markdown documents use optional YAML front matter:
+
+````markdown
+---
+title: First Post
+date: 2026-08-30T12:00:00Z
+summary: A post built with Spork.
+tags: [spork, release]
+---
+## Hello
+
+```python
+print("Spork")
+```
+````
+
+Discovering a content directory returns an eager persistent vector of document maps:
+
+```clojure
+(ns example.site
+  (:require
+    [spork-site.build :as build]
+    [spork-site.collections :as collections]
+    [spork-site.content :as content]
+    [spork-site.core :as site :refer [element fragment markup]]
+    [spork-site.feeds :as feeds]
+    [spork-site.routing :as routing]
+    [spork-site.sitemap :as sitemap]))
+
+(def documents (content.load-documents "content"))
+```
+
+Each document contains front-matter fields at the top level plus canonical fields:
+
+```clojure
+{:source-path   #p"content/blog/first.md"
+ :relative-path "blog/first.md"
+ :id            "blog/first"
+ :slug          "first"
+ :route         "/blog/first/"
+ :metadata      {:title "First Post" ...}
+ :body          "## Hello\n..."
+ :content       (Fragment [...])
+ :title         "First Post"
+ :date          #inst"2026-08-30T12:00:00Z"}
+```
+
+YAML mappings and sequences become persistent maps and vectors. YAML dates remain Python `date`/`datetime` values. Front-matter sets are rejected because they are unordered.
+
+Routes are derived from relative paths:
+
+| Source | Route | Output |
+|---|---|---|
+| `index.md` | `/` | `index.html` |
+| `docs/index.md` | `/docs/` | `docs/index.html` |
+| `blog/hello.md` | `/blog/hello/` | `blog/hello/index.html` |
+
+Use `slug`, `route`, `permalink`, or `url` front matter to override the derived route. Explicit routes are validated and canonicalized.
+
+Pass `:patterns` to select several deterministic globs, or disable highlighting when loading:
+
+```clojure
+(content.load-documents
+  "content"
+  * :patterns ["docs/**/*.md" "blog/**/*.md"]
+    :highlight? false)
+```
+
+## Collections
+
+Collections use ordinary Spork predicates and callable keys rather than a query language:
+
+```clojure
+(defn published? [document]
+  (not (is (:draft document) true)))
+
+(def posts
+  (collections.collection
+    documents
+    * :where published?
+      :sort-by :date
+      :order :desc
+      :limit 20))
+```
+
+`collection`, `filter-documents`, and `sort-documents` eagerly return persistent vectors. Standard functions such as `filter`, `group-by`, `take`, and eager `(for ...)` expressions remain available for further composition.
+
+## Components, layouts, and generated routes
+
+Components and layouts are ordinary functions returning node-like values:
+
+```clojure
+(defn document-layout [document]
+  (markup
+    ($html {:lang "en"}
+      ($head
+        ($meta {:charset "utf-8"})
+        ($meta {:name "viewport"
+                :content "width=device-width, initial-scale=1"})
+        ($title (:title document))
+        ($link {:rel "stylesheet" :href "/site.css"}))
+      ($body
+        ($main {:class "prose"}
+          ($h1 (:title document))
+          (:content document))))))
+
+(def content-pages
+  (routing.pages-for posts document-layout))
+```
+
+`pages-for` is equivalent to an eager generated route expression:
+
+```clojure
+(for [document posts]
+  (routing.page (:route document)
+                (document-layout document)))
+```
+
+`routing.page` serializes structural content as escaped HTML. Use `routing.output-file` for already serialized text or bytes such as `robots.txt`, XML, or JSON.
+
+Duplicate canonical routes, page/asset collisions, and file/directory output conflicts fail before output is cleaned or written.
+
+## Syntax highlighting
+
+Fenced Markdown code gets a `language-*` class during Markdown conversion. Content loading applies Pygments by default and retains the shared structure:
+
+```clojure
+(def highlighted
+  (site.highlight-syntax
+    (site.render-markdown "```spork\n(+ 1 2)\n```")))
+```
+
+The result remains `Element("pre")` containing `Element("code")`; only Pygments' trusted, escaped span markup is represented as `RawHtml`. Unknown lexer names leave the original code block unchanged.
+
+## Sitemap and feeds
+
+Sitemap entries are any route-bearing maps. `:lastmod`, `:changefreq`, and `:priority` are optional, and `:sitemap false` excludes an entry:
+
+```clojure
+(def sitemap-output
+  (sitemap.sitemap "https://example.com" posts))
+```
+
+RSS and Atom consume the same document maps. Entries require `:title`, `:route`, and one of `:updated`, `:date`, or `:published`. Drafts and entries with `:feed false` are excluded.
+
+```clojure
+(def feed-config
+  {:title "Example Blog"
+   :description "News from Example"
+   :url "https://example.com"
+   :author "Example Authors"})
+
+(def rss-output (feeds.rss feed-config posts))
+(def atom-output (feeds.atom feed-config posts))
+```
+
+Feed timestamps derive from content dates, never the wall clock, so repeated builds are byte-for-byte stable. Empty feeds require an explicit `:updated` value.
+
+## Complete build
+
+A site is an ordinary persistent map constructed by `build.site`:
+
+```clojure
+(defn make-site []
+  (build.site
+    * :output "public"
+      :pages [content-pages
+              (routing.output-file "/sitemap.xml" sitemap-output)
+              (routing.output-file "/feed.xml" rss-output)
+              (routing.output-file "/atom.xml" atom-output)]
+      :assets (build.discover-assets "static")
+      :transforms []))
+```
+
+The factory is an ordinary source function. Configure it independently from the application's `:main`:
+
+```clojure
+{:name "example"
+ :version "0.1.0"
+ :spork-version ">=0.6,<0.7"
+ :dependencies ["spork-site>=0.1,<0.2"]
+ :source-paths ["src"]
+
+ :site
+ {:target "example.site:make-site"
+  :watch ["spork.it" "src" "content" "static"]}
+
+ :main "example.app:main"}
+```
+
+Synchronize once, then use the project-local provider:
+
+```bash
+spork sync
+spork site check
+spork site routes
+spork site build
+spork site clean
+```
+
+`spork-site` loads `example.site:make-site` directly from configured source paths through the Spork command context. The site does not need an ahead-of-time build, a Python-importable adapter, a replacement application entry point, or manual virtualenv activation.
+
+A build:
+
+1. validates and canonicalizes every route;
+2. detects duplicate, page/asset, and parent/child path conflicts;
+3. renders all page content and transformations;
+4. validates asset sources and output safety;
+5. cleans the output directory by default;
+6. writes pages and assets in lexical output-path order;
+7. returns a persistent summary map.
+
+```clojure
+{:output #p"/project/public"
+ :pages 12
+ :assets 4
+ :written ["atom.xml" "feed.xml" "index.html" ...]}
+```
+
+Set `:clean? false` to retain unrelated output files. Output paths cannot be the project directory, an ancestor of it, or a filesystem root. Asset sources inside a cleaned output directory are rejected before deletion.
+
+## Site commands
+
+The package owns one complete top-level CLI:
+
+```text
+spork site build [--output PATH] [--no-clean] [--json]
+spork site check [--json]
+spork site clean [--output PATH]
+spork site routes [--json]
+spork site version
+```
+
+`check` loads the source factory and constructs the complete rendered page, asset, conflict, and output plan without creating, cleaning, or writing the output directory. `routes` performs the same validation and reports canonical route/output pairs. `clean` uses the factory's configured output by default and applies the same project-root and filesystem-root protections as builds. `version` reports the selected provider version, Spork host version, command API, and project/active scope.
+
+The former built-module facade remains temporarily available for compatibility:
+
+```bash
+spork run --main spork-site.cli:main build example.site:site-config public
+```
+
+It is no longer the primary project workflow.
 
 ## Markup
 
-Import the public API and the `markup` macro:
+`markup` only gives special meaning to lists headed by a `$`-prefixed symbol. Components, conditionals, calls, data access, and iteration remain ordinary Spork:
 
 ```clojure
-(ns example.page
-  (:require [spork-site.core :as site
-             :refer [element fragment markup]]))
-
 (defn post-card [post]
   (markup
     ($article {:class "post"}
-      ($h2 (:title post))
+      ($h2 ($a {:href (:route post)} (:title post)))
       ($p (:summary post)))))
 
 (defn homepage [posts]
@@ -47,96 +285,42 @@ Import the public API and the `markup` macro:
         (post-card post)))))
 ```
 
-`markup` only gives special meaning to lists headed by a `$`-prefixed symbol. Components, conditionals, calls, and data access remain ordinary Spork. Eager `(for ...)` expressions return persistent vectors, so generated children compose directly. Use `(doseq ...)` when iteration is only for effects.
-
-The macro lowers to the public `element` and `fragment` bindings, so refer those names alongside `markup`. A qualified macro call also works:
+The macro lowers to public `element` and `fragment` bindings, so refer those names with `markup`. A qualified macro call also works:
 
 ```clojure
 (site.markup
   ($spork-playground {:source "(+ 1 2)"}))
 ```
 
-## Markdown composition
+## Markdown and transformations
 
-`spork-site.markdown` parses CommonMark and returns a `Fragment`, never an opaque serialized HTML string:
-
-```clojure
-(ns example.docs
-  (:require
-    [spork-site.core :as site :refer [markup]]
-    [spork-site.markdown :as markdown]))
-
-(def page
-  {:title "Installation"
-   :content (markdown.render
-              "## Install\n\nRun `spork sync`.\n")
-   :edit-url "/edit/install"})
-
-(def document
-  (markup
-    ($article {:class "prose"}
-      ($h1 (:title page))
-      (:content page)
-      ($a {:href (:edit-url page)} "Edit this page"))))
-
-(site.render-html document)
-```
-
-Output:
-
-```html
-<article class="prose"><h1>Installation</h1><h2>Install</h2><p>Run <code>spork sync</code>.</p><a href="/edit/install">Edit this page</a></article>
-```
-
-The Markdown API has explicit parsing and conversion stages when plugins or AST inspection need them:
+`spork-site.markdown` parses CommonMark into `Fragment`, `Element`, `Text`, and explicit `RawHtml` values, never an opaque HTML string:
 
 ```clojure
-(def ast (markdown.parse source))
-(def nodes (markdown.ast-to-nodes ast))
-
-(markdown.render source)       ; parse and convert
-(markdown.render-file path)    ; UTF-8 file
-
-; Supply a configured markdown-it parser
-(def safe-parser (markdown.make-parser false)) ; disable raw HTML parsing
-(markdown.render-with safe-parser source)
+(def ast (site.parse-markdown source))
+(def nodes (site.markdown-ast-to-nodes ast))
+(def content (site.render-markdown source))
 ```
 
-With the default parser, inline and block HTML tokens become explicit `RawHtml` nodes. Surrounding Markdown text remains `Text` and is escaped normally. `make-parser` accepts an optional boolean controlling Markdown raw HTML; it defaults to `true`.
+With the default parser, inline and block HTML tokens become explicit `RawHtml` nodes. Surrounding text remains escaped `Text`. Use `(site.make-markdown-parser false)` to disable Markdown raw HTML.
 
-The core facade exposes unambiguous aliases such as `site.render-markdown`, `site.parse-markdown`, and `site.markdown-ast-to-nodes`. The dedicated `spork-site.markdown` namespace is preferred when using the complete Markdown API.
-
-## Generic transformations
-
-`transform` walks a node tree depth-first and invokes a function post-order, after transformed children have been installed in a fresh immutable parent. The same pass therefore handles authored and Markdown-generated nodes:
+`transform` walks a node tree depth-first and invokes a function post-order after transformed children have been installed in a fresh immutable parent:
 
 ```clojure
-(defn heading? [node]
-  (and (isinstance node site.Element)
-       (contains? #{"h1" "h2" "h3" "h4" "h5" "h6"} node.tag)))
-
 (defn mark-heading [node]
-  (if (heading? node)
+  (if (and (isinstance node site.Element)
+           (contains? #{"h1" "h2" "h3" "h4" "h5" "h6"} node.tag))
     (site.Element node.tag
                   (assoc node.attrs "data-heading" true)
                   node.children)
     node))
 
-(def transformed (site.transform document mark-heading))
+(def transformed (site.transform content mark-heading))
 ```
 
-A transform may return:
-
-- a node to retain or replace the current node;
-- `nil` to remove it;
-- a deterministic sequence to splice through a `Fragment`;
-- a printable scalar to create a `Text` node.
-
-Replacement nodes are not revisited during the same pass. Maps and unordered sets are rejected as markup and transformation results.
+A transform may return a node, `nil` to remove it, a deterministic sequence to splice through a fragment, or a printable scalar to create a `Text` node.
 
 ## Low-level node API
-
-The DSL and Markdown conversion both produce the explicit API available to programs and plugins:
 
 ```clojure
 (site.element :a {:class ["button" "primary"]
@@ -158,40 +342,42 @@ Child rules are intentionally small:
 - maps and unordered sets are rejected as children;
 - `RawHtml` is the explicit escape hatch for trusted, unescaped markup.
 
-Attributes are normalized when an element is constructed. `:class` accepts nested sequences and ignores `nil`; `:style` accepts a string or a deterministically ordered map. `nil` and `false` attributes are omitted, while `true` attributes serialize in HTML boolean form. Attribute names and output order are deterministic.
+Attributes are normalized during construction. `:class` accepts nested sequences and ignores `nil`; `:style` accepts a string or deterministically ordered map. `nil` and `false` attributes are omitted, while `true` attributes serialize in HTML boolean form.
 
 ## Development
 
-The project requires Spork 0.5.3 or later in the 0.5 line:
+The project requires Spork 0.6 in order to publish and exercise the command-provider API:
 
 ```bash
 spork sync --dev
-spork version
 spork check
-spork run
 spork test
+spork run version
 spork build --clean
 spork dist --clean
 ```
 
-`spork run` renders a small smoke-test document. The native suite covers node construction, markup lowering, normalization, escaping, CommonMark AST conversion, all primary block/inline structures, Markdown raw HTML, file rendering, mixed composition, and transformation replacement semantics.
+The test suite includes structural unit tests and an end-to-end documentation-and-blog fixture covering front matter, recursive discovery, collections, generated routes, layouts, syntax highlighting, assets, deterministic rebuilding, sitemap, RSS, and Atom.
 
 ## Project layout
 
 ```text
-spork-site/
-├── spork.it
-├── src/spork_site/
-│   ├── core.spork        # public facade and entrypoint
-│   ├── markdown.spork    # CommonMark parser and AST conversion
-│   ├── markup.spork      # locally scoped $tag macro
-│   ├── nodes.spork       # immutable nodes and normalization
-│   ├── render.spork      # deterministic HTML serialization
-│   └── transforms.spork  # generic immutable tree transformations
-└── tests/spork_site/
-    ├── core_test.spork
-    ├── markdown_test.spork
-    └── transforms_test.spork
+src/spork_site/
+├── build.spork        # deterministic output planning and execution
+├── cli.spork          # package-owned build/check/clean/routes/version CLI
+├── collections.spork  # eager document filtering and sorting
+├── content.spork      # front matter, discovery, and document loading
+├── core.spork         # general public facade
+├── feeds.spork        # RSS and Atom
+├── highlight.spork    # structural Pygments integration
+├── markdown.spork     # CommonMark AST conversion
+├── markup.spork       # locally scoped $tag macro
+├── nodes.spork        # immutable nodes and normalization
+├── render.spork       # deterministic HTML serialization
+├── routing.spork      # routes and generated pages
+├── sitemap.spork      # sitemap XML
+├── transforms.spork   # generic immutable tree transformations
+└── xml.spork          # shared XML/date/URL helpers
 ```
 
-`spork-site.core` remains the general public facade. `spork-site.markdown` is also a supported focused namespace for Markdown integration.
+Focused namespaces are supported APIs; `spork-site.core` re-exports the general application-facing surface.

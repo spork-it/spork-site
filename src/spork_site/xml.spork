@@ -1,0 +1,84 @@
+;; Deterministic XML and URL helpers shared by feeds and sitemaps.
+(ns spork-site.xml
+  (:require
+    [spork-site.nodes :refer [scalar-string]]
+    [spork-site.routing :refer [normalize-route]])
+  (:import
+    [datetime :refer [date datetime timezone]]
+    [email.utils :refer [format_datetime]]
+    [html :as html-lib]
+    [urllib.parse :refer [urljoin urlsplit]]))
+
+(def xml-declaration "<?xml version=\"1.0\" encoding=\"utf-8\"?>")
+
+(defn escape-xml [value]
+  (html-lib.escape (scalar-string value) false))
+
+(defn escape-xml-attribute [value]
+  (html-lib.escape (scalar-string value) true))
+
+(defn render-xml-attributes [attrs]
+  (.join ""
+    (map
+      (fn [pair]
+        (+ " " (nth pair 0) "=\""
+           (escape-xml-attribute (nth pair 1)) "\""))
+      (sorted (attrs.items) *{:key first}))))
+
+(defn xml-element
+  ([tag value]
+   (+ "<" tag ">" (escape-xml value) "</" tag ">"))
+  ([tag attrs value]
+   (+ "<" tag (render-xml-attributes attrs) ">"
+      (escape-xml value) "</" tag ">")))
+
+(defn xml-raw-element [tag value]
+  (+ "<" tag ">" value "</" tag ">"))
+
+(defn xml-empty-element [tag attrs]
+  (+ "<" tag (render-xml-attributes attrs) "/>"))
+
+(defn base-url [value]
+  "Validate and normalize an absolute HTTP(S) site URL."
+  (if (not (isinstance value str))
+    (throw (TypeError "site URL must be a string")))
+  (let [parsed (urlsplit value)]
+    (if (not (contains? #{"http" "https"} parsed.scheme))
+      (throw (ValueError "site URL must use http or https")))
+    (if (= parsed.netloc "")
+      (throw (ValueError "site URL must include a host")))
+    (if (or (not (= parsed.query "")) (not (= parsed.fragment "")))
+      (throw (ValueError "site URL cannot contain a query or fragment"))))
+  (.rstrip value "/"))
+
+(defn absolute-url [site-url route]
+  (urljoin (+ (base-url site-url) "/") (get (normalize-route route) #[1 _])))
+
+(defn parse-date-string [value]
+  (let [cleaned (if (.endswith value "Z")
+                  (+ (get value #[0 -1]) "+00:00")
+                  value)]
+    (try
+      (datetime.fromisoformat cleaned)
+      (catch ValueError error
+        (date.fromisoformat cleaned)))))
+
+(defn utc-date-time [value]
+  "Normalize a date, datetime, or ISO string to an aware UTC datetime."
+  (let [parsed (if (isinstance value str) (parse-date-string value) value)]
+    (cond
+      (isinstance parsed datetime)
+        (if (= parsed.tzinfo nil)
+          (parsed.replace *{:tzinfo timezone.utc})
+          (parsed.astimezone timezone.utc))
+      (isinstance parsed date)
+        (datetime parsed.year parsed.month parsed.day *{:tzinfo timezone.utc})
+      :else
+        (throw (TypeError "feed dates must be dates, datetimes, or ISO strings")))))
+
+(defn iso-date [value]
+  (.replace (.isoformat (utc-date-time value) *{:timespec "seconds"})
+            "+00:00" "Z"))
+
+(defn rfc-2822-date [value]
+  (format_datetime (utc-date-time value) *{:usegmt true}))

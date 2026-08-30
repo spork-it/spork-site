@@ -1,0 +1,78 @@
+;; Deterministic XML sitemap generation.
+(ns spork-site.sitemap
+  (:require
+    [spork-site.routing :refer [normalize-route]]
+    [spork-site.xml :refer [absolute-url iso-date xml-declaration xml-element]])
+  (:import
+    [collections.abc :refer [Mapping]]))
+
+(def change-frequencies
+  #{"always" "hourly" "daily" "weekly" "monthly" "yearly" "never"})
+
+(defn entry-option
+  ([entry key]
+   (entry-option entry key nil))
+  ([entry key default]
+   (cond
+     (contains? entry key) (get entry key)
+     (and (isinstance (get entry :metadata) Mapping)
+          (contains? (get entry :metadata) key))
+       (get (get entry :metadata) key)
+     :else default)))
+
+(defn normalize-change-frequency [value]
+  (if (= value nil)
+    nil
+    (let [name (cond
+                 (isinstance value Keyword) value.name
+                 (isinstance value str) (.lower value)
+                 :else (throw (TypeError "sitemap changefreq must be a string or keyword")))]
+      (if (not (contains? change-frequencies name))
+        (throw (ValueError (fmt "invalid sitemap changefreq: {}" name))))
+      name)))
+
+(defn normalize-priority [value]
+  (if (= value nil)
+    nil
+    (do
+      (if (not (or (isinstance value int) (isinstance value float)))
+        (throw (TypeError "sitemap priority must be numeric")))
+      (if (or (< value 0) (> value 1))
+        (throw (ValueError "sitemap priority must be between 0 and 1")))
+      (fmt "{:.1f}" value))))
+
+(defn sitemap-entry [site-url entry]
+  (if (not (isinstance entry Mapping))
+    (throw (TypeError "sitemap entries must be maps")))
+  (let [route (entry-option entry :route)
+        lastmod (entry-option entry :lastmod)
+        changefreq (normalize-change-frequency (entry-option entry :changefreq))
+        priority (normalize-priority (entry-option entry :priority))
+        values [(xml-element "loc" (absolute-url site-url route))
+                (if (= lastmod nil) nil (xml-element "lastmod" (iso-date lastmod)))
+                (if (= changefreq nil) nil (xml-element "changefreq" changefreq))
+                (if (= priority nil) nil (xml-element "priority" priority))]]
+    (+ "  <url>\n    "
+       (.join "\n    " (filter (fn [value] (not (= value nil))) values))
+       "\n  </url>")))
+
+(defn sitemap [site-url entries]
+  "Generate a deterministic sitemap.xml string from route-bearing maps."
+  (let [included
+          (filter (fn [entry] (not (is (entry-option entry :sitemap true) false)))
+                  entries)
+        ordered (sorted included
+                        *{:key (fn [entry]
+                                 (normalize-route (entry-option entry :route)))})]
+    (reduce
+      (fn [seen entry]
+        (let [route (normalize-route (entry-option entry :route))]
+          (if (contains? seen route)
+            (throw (ValueError (fmt "duplicate sitemap route: {}" route)))
+            (conj seen route))))
+      #{}
+      ordered)
+    (+ xml-declaration
+       "\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+       (.join "\n" (map (fn [entry] (sitemap-entry site-url entry)) ordered))
+       "\n</urlset>\n")))

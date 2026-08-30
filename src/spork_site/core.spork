@@ -1,4 +1,4 @@
-;; Public node, Markdown, transformation, and serialization API.
+;; Public markup, content, routing, publishing, and build API.
 (ns spork-site.core
   (:require
     [spork-site.nodes :refer [Element Fragment RawHtml Text
@@ -11,7 +11,22 @@
     [spork-site.markup :refer [markup]]
     [spork-site.markdown :as markdown]
     [spork-site.transforms :refer [node? normalize-transform-result
-                                    transform transform-node]]))
+                                    transform transform-node]]
+    [spork-site.highlight :refer [highlight-node highlight-syntax
+                                   language-from-class]]
+    [spork-site.content :refer [default-patterns discover-markdown
+                                 document-route load-documents load-markdown
+                                 parse-front-matter persistent-data]]
+    [spork-site.collections :refer [collection filter-documents
+                                     sort-documents]]
+    [spork-site.routing :refer [normalize-pages normalize-route output-file
+                                 page pages-for route-output-path
+                                 route-output-relative route-table]]
+    [spork-site.build :refer [asset build-plan build-site build-target
+                               check-site clean-site discover-assets load-site
+                               site site-routes]]
+    [spork-site.sitemap :refer [sitemap sitemap-entry]]
+    [spork-site.feeds :refer [atom rss]]))
 
 ;; Unambiguous facade names keep Markdown parsing distinct from HTML serialization.
 (def make-markdown-parser markdown.make-parser)

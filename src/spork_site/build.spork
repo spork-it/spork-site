@@ -1,0 +1,263 @@
+;; Deterministic full static builds for pages and copied assets.
+(ns spork-site.build
+  (:require
+    [spork-site.nodes :refer [sequence-value?]]
+    [spork-site.render :refer [render-html]]
+    [spork-site.routing :refer [route-output-relative route-table]]
+    [spork-site.transforms :refer [transform]])
+  (:import
+    [collections.abc :refer [Mapping Set :as AbstractSet]]
+    [importlib :refer [import_module]]
+    [os.path :refer [abspath]]
+    [pathlib :refer [Path PurePosixPath]]
+    [shutil :refer [copyfile rmtree]]))
+
+(defn site [* (pages []) (assets []) (transforms []) (output "dist") (clean? true)]
+  "Construct an immutable site configuration."
+  {:pages pages
+   :assets assets
+   :transforms (into [] transforms)
+   :output output
+   :clean? (bool clean?)})
+
+(defn invalid-asset-part? [part]
+  (or (= part ".") (= part "..") (= part "")))
+
+(defn file? [path]
+  (path.is-file))
+
+(defn validate-asset-target [target]
+  (if (not (isinstance target str))
+    (throw (TypeError "asset target must be a relative POSIX path string")))
+  (if (or (in "\\" target) (in (chr 0) target))
+    (throw (ValueError (fmt "invalid asset target: {}" (repr target)))))
+  (let [path (PurePosixPath target)]
+    (if (or (path.is-absolute) (= target "") (= target "."))
+      (throw (ValueError (fmt "invalid asset target: {}" (repr target)))))
+    (if (some invalid-asset-part? path.parts)
+      (throw (ValueError (fmt "invalid asset target: {}" (repr target)))))
+    (path.as-posix)))
+
+(defn asset
+  ([source]
+   (asset source (. (Path source) name)))
+  ([source target]
+   (let [source-path (Path source)]
+     (if (not (source-path.is-file))
+       (throw (ValueError (fmt "asset source is not a file: {}" source-path))))
+     {:kind :asset
+      :source source-path
+      :target (validate-asset-target target)})))
+
+(defn discover-assets [root]
+  "Return deterministic asset declarations for every file below root."
+  (let [root-path (Path root)]
+    (if (not (root-path.is-dir))
+      (throw (ValueError (fmt "asset root is not a directory: {}" root-path))))
+    (for [source (sorted (filter file? (root-path.rglob "*"))
+                         *{:key (fn [path]
+                                  (.as-posix (path.relative-to root-path)))})]
+      (asset source (.as-posix (source.relative-to root-path))))))
+
+(defn append-asset [assets value]
+  (cond
+    (= value nil) assets
+    (isinstance value Mapping) (conj assets value)
+    (or (isinstance value AbstractSet) (isinstance value str) (isinstance value bytes))
+      (throw (TypeError "assets must be asset maps or deterministic sequences"))
+    (sequence-value? value) (reduce append-asset assets value)
+    :else (throw (TypeError "assets must be asset maps or deterministic sequences"))))
+
+(defn normalize-assets [values]
+  (append-asset [] values))
+
+(defn apply-transforms [content functions]
+  (reduce
+    (fn [tree function]
+      (if (not (callable function))
+        (throw (TypeError "site transforms must be callable")))
+      (transform tree function))
+    content
+    functions))
+
+(defn page-bytes [page-value functions]
+  (let [kind (get page-value :kind :page)
+        content (:content page-value)]
+    (cond
+      (= kind :output-file)
+        (cond
+          (isinstance content bytes) content
+          (isinstance content str) (.encode content "utf-8")
+          :else (throw (TypeError "raw output content must be text or bytes")))
+      (= kind :page)
+        (.encode (render-html (apply-transforms content functions)) "utf-8")
+      :else (throw (ValueError (fmt "unknown page kind: {}" kind))))))
+
+(defn page-plan [pages functions]
+  (map
+    (fn [pair]
+      (let [route (nth pair 0)
+            page-value (nth pair 1)]
+        {:kind :write
+         :route route
+         :target (.as-posix (route-output-relative route))
+         :content (page-bytes page-value functions)}))
+    (.items (route-table pages))))
+
+(defn asset-plan [assets]
+  (map
+    (fn [asset-value]
+      (let [source (Path (:source asset-value))]
+        (if (not (source.is-file))
+          (throw (ValueError (fmt "asset source is not a file: {}" source))))
+        {:kind :copy
+         :source source
+         :target (validate-asset-target (:target asset-value))}))
+    (normalize-assets assets)))
+
+(defn pair-value [pair]
+  (nth pair 1))
+
+(defn build-plan [site-value]
+  "Create a deterministic output plan and reject page/asset conflicts."
+  (if (not (isinstance site-value Mapping))
+    (throw (TypeError "site configuration must be a map")))
+  (let [functions (into [] (get site-value :transforms []))
+        entries (concat (page-plan (get site-value :pages []) functions)
+                        (asset-plan (get site-value :assets [])))
+        table
+          (reduce
+            (fn [result entry]
+              (let [target (:target entry)]
+                (if (contains? result target)
+                  (throw (ValueError (fmt "output path conflict: {}" target)))
+                  (assoc result target entry))))
+            {}
+            entries)]
+    (let [ordered
+          (into []
+            (map pair-value (sorted (table.items) *{:key first})))]
+      (doseq [parent ordered]
+        (doseq [child ordered]
+          (let [parent-parts (. (PurePosixPath (:target parent)) parts)
+                child-parts (. (PurePosixPath (:target child)) parts)]
+            (if (and (< (count parent-parts) (count child-parts))
+                     (= parent-parts (get child-parts (slice 0 (count parent-parts)))))
+              (throw
+                (ValueError
+                  (fmt "output path conflict: {} is an ancestor of {}"
+                       (:target parent) (:target child))))))))
+      ordered)))
+
+(defn safe-output-root [output]
+  (let [root (Path (abspath output))
+        current (Path (abspath (Path.cwd)))]
+    (if (or (= root current) (in root current.parents))
+      (throw (ValueError "output directory cannot be the project root or its ancestor")))
+    (if (= root (Path root.anchor))
+      (throw (ValueError "output directory cannot be a filesystem root")))
+    root))
+
+(defn prepare-output [root clean?]
+  (if (root.exists)
+    (cond
+      (not clean?) nil
+      (root.is-symlink) (root.unlink)
+      (root.is-dir) (rmtree root)
+      :else (root.unlink)))
+  (root.mkdir *{:parents true :exist_ok true}))
+
+(defn execute-entry [root entry]
+  (let [target (apply root.joinpath (. (PurePosixPath (:target entry)) parts))]
+    (target.parent.mkdir *{:parents true :exist_ok true})
+    (if (= (:kind entry) :copy)
+      (copyfile (:source entry) target)
+      (target.write-bytes (:content entry)))
+    (:target entry)))
+
+(defn validate-plan-sources [root plan]
+  (doseq [entry plan]
+    (if (= (:kind entry) :copy)
+      (let [source (Path (abspath (:source entry)))]
+        (if (or (= source root) (in root source.parents))
+          (throw
+            (ValueError
+              (fmt "asset source is inside the output directory: {}" source))))))))
+
+(defn plan-summary [root plan]
+  (let [page-count (reduce (fn [total entry]
+                             (if (= (:kind entry) :write) (inc total) total))
+                           0
+                           plan)]
+    {:output root
+     :pages page-count
+     :assets (- (count plan) page-count)
+     :plan plan}))
+
+(defn check-site
+  ([site-value]
+   (check-site site-value nil))
+  ([site-value output]
+   "Validate and return a complete output plan without writing any files."
+   (let [selected-output (if (= output nil) (get site-value :output "dist") output)
+         root (safe-output-root selected-output)
+         plan (build-plan site-value)]
+     (validate-plan-sources root plan)
+     (plan-summary root plan))))
+
+(defn site-routes
+  ([site-value]
+   (site-routes site-value nil))
+  ([site-value output]
+   "Return canonical page routes and output paths without writing files."
+   (let [summary (check-site site-value output)]
+     (for [entry (filter (fn [item] (= (:kind item) :write)) (:plan summary))]
+       {:route (:route entry)
+        :output (:target entry)}))))
+
+(defn build-site
+  ([site-value]
+   (build-site site-value nil nil))
+  ([site-value output]
+   (build-site site-value output nil))
+  ([site-value output clean-override]
+   "Build every page and asset, returning a deterministic summary map."
+   (let [summary (check-site site-value output)
+         root (:output summary)
+         plan (:plan summary)
+         clean? (if (= clean-override nil)
+                  (bool (get site-value :clean? true))
+                  (bool clean-override))]
+     (prepare-output root clean?)
+     (let [written (for [entry plan] (execute-entry root entry))]
+       {:output root
+        :pages (:pages summary)
+        :assets (:assets summary)
+        :written written}))))
+
+(defn clean-site [output]
+  "Remove a safe output directory when it exists."
+  (let [root (safe-output-root output)]
+    (if (root.exists)
+      (if (root.is-symlink) (root.unlink) (rmtree root)))
+    root))
+
+(defn load-site [target]
+  "Load a built Python/Spork module value from module:attribute."
+  (if (not (isinstance target str))
+    (throw (TypeError "site target must be a module:attribute string")))
+  (let [parts (.rsplit target ":" 1)]
+    (if (not (= (count parts) 2))
+      (throw (ValueError "site target must use module:attribute syntax")))
+    (let [module (import_module (nth parts 0))
+          value (getattr module (nth parts 1))
+          loaded (if (callable value) (value) value)]
+      (if (not (isinstance loaded Mapping))
+        (throw (TypeError "loaded site value must be a map")))
+      loaded)))
+
+(defn build-target
+  ([target]
+   (build-site (load-site target)))
+  ([target output]
+   (build-site (load-site target) output)))

@@ -1,0 +1,5 @@
+(ns source-site.app)
+
+(defn ^int main [& args]
+  (print "application main")
+  0)

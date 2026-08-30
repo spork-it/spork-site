@@ -1,0 +1,201 @@
+;; Tests for routes, generated pages, assets, and deterministic builds.
+(ns spork-site.build-test
+  (:require
+    [spork-site.build :as build]
+    [spork-site.cli :as cli]
+    [spork-site.core :as site :refer [element markup]]
+    [spork-site.routing :as routing])
+  (:import
+    [pathlib :refer [Path]]
+    [sys :as sys]
+    [tempfile :refer [TemporaryDirectory]]))
+
+(defn raises? [expected-type function]
+  (try
+    (do (function) false)
+    (catch Exception error
+      (isinstance error expected-type))))
+
+(defn document-page [document]
+  (markup
+    ($article
+      ($h1 (:title document))
+      (:content document))))
+
+(defn decorate-main [node]
+  (if (and (isinstance node site.Element) (= node.tag "main"))
+    (site.Element node.tag (assoc node.attrs "data-built" true) node.children)
+    node))
+
+(deftest routes-are-canonical-safe-and-map-to-static-files
+  (assert (= (routing.normalize-route "/") "/"))
+  (assert (= (routing.normalize-route "/docs") "/docs/"))
+  (assert (= (routing.normalize-route "/feed.xml") "/feed.xml"))
+  (assert (= (str (routing.route-output-relative "/")) "index.html"))
+  (assert (= (str (routing.route-output-relative "/docs/")) "docs/index.html"))
+  (assert (= (str (routing.route-output-relative "/feed.xml")) "feed.xml"))
+  (assert (raises? ValueError (fn [] (routing.normalize-route "relative"))))
+  (assert (raises? ValueError (fn [] (routing.normalize-route "/a/../b/"))))
+  (assert (raises? ValueError (fn [] (routing.normalize-route "/a//b/"))))
+  (assert (raises? ValueError (fn [] (routing.normalize-route "/a/?x=1")))))
+
+(deftest generated-pages-are-eager-and-conflicts-are-explicit
+  (def documents
+    [{:title "One" :route "/one/" :content (site.element :p "first")}
+     {:title "Two" :route "/two/" :content (site.element :p "second")}])
+  (def pages (routing.pages-for documents document-page))
+  (assert (isinstance pages Vector))
+  (assert (= (mapv :route pages) ["/one/" "/two/"]))
+  (assert (= (site.render-html (:content (first pages)))
+             "<article><h1>One</h1><p>first</p></article>"))
+  (assert (= (count (routing.route-table pages)) 2))
+  (assert (raises? ValueError
+                   (fn []
+                     (routing.route-table
+                       [(routing.page "/same/" "one")
+                        (routing.page "/same" "two")])))))
+
+(deftest complete-builds-write-pages-assets-and-raw-outputs-deterministically
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def static-root (root.joinpath "static"))
+    (static-root.mkdir)
+    (.mkdir (static-root.joinpath "nested"))
+    (.write-text (static-root.joinpath "site.css") "body{}\n" *{:encoding "utf-8"})
+    (.write-text (static-root.joinpath "nested" "logo.txt") "SPORK\n" *{:encoding "utf-8"})
+    (def output (root.joinpath "public"))
+    (output.mkdir)
+    (.write-text (output.joinpath "stale.txt") "remove me" *{:encoding "utf-8"})
+    (def config
+      (build.site
+        * :output output
+          :transforms [decorate-main]
+          :pages [(routing.page "/"
+                    (markup ($main ($h1 "Home"))))
+                  (routing.page "/docs/"
+                    (markup ($main ($p "Docs"))))
+                  (routing.output-file "/robots.txt" "User-agent: *\n")]
+          :assets (build.discover-assets static-root)))
+    (def first-summary (build.build-site config))
+    (assert (= (:pages first-summary) 3))
+    (assert (= (:assets first-summary) 2))
+    (assert (= (:written first-summary)
+               ["docs/index.html" "index.html" "nested/logo.txt"
+                "robots.txt" "site.css"]))
+    (assert (not (.exists (output.joinpath "stale.txt"))))
+    (assert (= (.read-text (output.joinpath "index.html") *{:encoding "utf-8"})
+               "<main data-built><h1>Home</h1></main>"))
+    (assert (= (.read-text (output.joinpath "docs" "index.html")
+                           *{:encoding "utf-8"})
+               "<main data-built><p>Docs</p></main>"))
+    (assert (= (.read-text (output.joinpath "robots.txt") *{:encoding "utf-8"})
+               "User-agent: *\n"))
+    (assert (= (.read-text (output.joinpath "nested" "logo.txt")
+                           *{:encoding "utf-8"})
+               "SPORK\n"))
+    (def first-html (.read-bytes (output.joinpath "index.html")))
+    (def second-summary (build.build-site config))
+    (assert (= (:written second-summary) (:written first-summary)))
+    (assert (= (.read-bytes (output.joinpath "index.html")) first-html))
+    (.write-text (output.joinpath "retained.txt") "keep" *{:encoding "utf-8"})
+    (build.build-site config nil false)
+    (assert (.is-file (output.joinpath "retained.txt")))
+    (assert (= (build.clean-site output) (.absolute output)))
+    (assert (not (output.exists)))))
+
+(deftest checks-and-route-listing-construct-the-complete-plan-without-writing
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def static-root (root.joinpath "static"))
+    (static-root.mkdir)
+    (.write-text (static-root.joinpath "site.css") "body{}\n" *{:encoding "utf-8"})
+    (def output (root.joinpath "public"))
+    (def config
+      (build.site
+        * :output output
+          :pages [(routing.page "/" (markup ($main "Home")))
+                  (routing.output-file "/feed.xml" "<feed/>")]
+          :assets (build.discover-assets static-root)))
+    (def summary (build.check-site config))
+    (assert (= (:output summary) (.absolute output)))
+    (assert (= (:pages summary) 2))
+    (assert (= (:assets summary) 1))
+    (assert (= (mapv :target (:plan summary))
+               ["feed.xml" "index.html" "site.css"]))
+    (assert (= (build.site-routes config)
+               [{:route "/feed.xml" :output "feed.xml"}
+                {:route "/" :output "index.html"}]))
+    (assert (not (output.exists)))))
+
+(deftest page-asset-and-asset-asset-conflicts-fail-before-writing
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def source-a (root.joinpath "a.txt"))
+    (def source-b (root.joinpath "b.txt"))
+    (source-a.write-text "a")
+    (source-b.write-text "b")
+    (assert
+      (raises? ValueError
+        (fn []
+          (build.build-plan
+            (build.site
+              * :pages [(routing.page "/" (site.element :p "home"))]
+                :assets [(build.asset source-a "index.html")])))))
+    (assert
+      (raises? ValueError
+        (fn []
+          (build.build-plan
+            (build.site
+              * :assets [(build.asset source-a "same.txt")
+                         (build.asset source-b "same.txt")])))))
+    (assert
+      (raises? ValueError
+        (fn []
+          (build.build-plan
+            (build.site
+              * :pages [(routing.page "/docs/" (site.element :p "docs"))]
+                :assets [(build.asset source-a "docs")])))))))
+
+(deftest site-target-loading-and-cli-version-are-available
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def module-path (root.joinpath "fixture_loaded_site.py"))
+    (module-path.write-text
+      "site_config = {'loaded': True}\ndef make_site():\n    return site_config\n"
+      *{:encoding "utf-8"})
+    (sys.path.insert 0 (str root))
+    (try
+      (do
+        (assert (= (get (build.load-site "fixture_loaded_site:site_config") "loaded") true))
+        (assert (= (get (build.load-site "fixture_loaded_site:make_site") "loaded") true)))
+      (finally
+        (sys.path.pop 0))))
+  (assert (raises? ValueError (fn [] (build.load-site "missing-colon"))))
+  (assert (= (cli.main "version") 0)))
+
+(deftest unsafe-output-and-asset-paths-are-rejected
+  (with [directory (TemporaryDirectory)]
+    (def root (Path directory))
+    (def source (root.joinpath "file.txt"))
+    (source.write-text "x")
+    (assert (raises? ValueError (fn [] (build.asset source "../escape.txt"))))
+    (assert (raises? ValueError (fn [] (build.asset source "/absolute.txt"))))
+    (assert (raises? ValueError (fn [] (build.asset source "nested\\escape.txt"))))
+    (def output (root.joinpath "output"))
+    (output.mkdir)
+    (def nested-source (output.joinpath "asset.txt"))
+    (nested-source.write-text "keep")
+    (assert
+      (raises? ValueError
+        (fn []
+          (build.build-site
+            (build.site * :output output
+                        :assets [(build.asset nested-source "asset.txt")])))))
+    (assert (nested-source.exists)))
+  (assert (raises? ValueError (fn [] (build.safe-output-root (Path.cwd)))))
+  (assert (raises? ValueError
+                   (fn []
+                     (build.safe-output-root
+                       (.joinpath (Path.cwd) "child" "..")))))
+  (assert (raises? ValueError
+                   (fn [] (build.safe-output-root (. (Path.cwd) parent))))))

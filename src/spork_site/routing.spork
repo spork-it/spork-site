@@ -1,0 +1,116 @@
+;; Deterministic static routes and generated page declarations.
+(ns spork-site.routing
+  (:require
+    [spork-site.nodes :refer [sequence-value?]])
+  (:import
+    [collections.abc :refer [Mapping Set :as AbstractSet]]
+    [pathlib :refer [Path PurePosixPath]]
+    [urllib.parse :refer [urlsplit]]))
+
+(defn route-error [route reason]
+  (ValueError (fmt "invalid static route {}: {}" (repr route) reason)))
+
+(defn whitespace? [character]
+  (character.isspace))
+
+(defn dot-segment? [segment]
+  (or (= segment ".") (= segment "..")))
+
+(defn empty-segment? [segment]
+  (= segment ""))
+
+(defn normalize-route [route]
+  "Validate a site-local route and return its canonical spelling."
+  (if (not (isinstance route str))
+    (throw (TypeError "route must be a string")))
+  (if (= route "")
+    (throw (route-error route "route cannot be empty")))
+  (if (not (.startswith route "/"))
+    (throw (route-error route "route must start with '/'")))
+  (if (or (in "\\" route) (in (chr 0) route))
+    (throw (route-error route "backslashes and NUL bytes are not allowed")))
+  (if (some whitespace? route)
+    (throw (route-error route "whitespace must be percent-encoded")))
+  (let [parsed (urlsplit route)]
+    (if (or (not (= parsed.scheme ""))
+            (not (= parsed.netloc ""))
+            (not (= parsed.query ""))
+            (not (= parsed.fragment "")))
+      (throw (route-error route "routes cannot contain an origin, query, or fragment"))))
+  (let [segments (.split route "/")]
+    (if (some dot-segment? segments)
+      (throw (route-error route "'.' and '..' segments are not allowed")))
+    (if (some empty-segment? (get segments #[1 -1]))
+      (throw (route-error route "empty path segments are not allowed"))))
+  (if (= route "/")
+    "/"
+    (let [last-segment (last (.split (.rstrip route "/") "/"))
+          file-route? (not (= (. (PurePosixPath last-segment) suffix) ""))]
+      (if (or (.endswith route "/") file-route?)
+        route
+        (+ route "/")))))
+
+(defn route-output-relative [route]
+  "Map a canonical route to a relative static output path."
+  (let [canonical (normalize-route route)]
+    (cond
+      (= canonical "/") (PurePosixPath "index.html")
+      (.endswith canonical "/")
+        (.joinpath (PurePosixPath (get canonical #[1 _])) "index.html")
+      :else (PurePosixPath (get canonical #[1 _])))))
+
+(defn route-output-path [output route]
+  "Resolve a route under output without allowing path traversal."
+  (let [root (Path output)
+        relative (route-output-relative route)]
+    (apply root.joinpath relative.parts)))
+
+(defn page
+  ([route content]
+   (page route content {}))
+  ([route content metadata]
+   (if (not (isinstance metadata Mapping))
+     (throw (TypeError "page metadata must be a map")))
+   {:kind :page
+    :route (normalize-route route)
+    :content content
+    :metadata (into {} (metadata.items))}))
+
+(defn output-file
+  ([route content]
+   (output-file route content {}))
+  ([route content metadata]
+   (if (not (or (isinstance content str) (isinstance content bytes)))
+     (throw (TypeError "raw output content must be text or bytes")))
+   (assoc (page route content metadata) :kind :output-file)))
+
+(defn pages-for [documents render]
+  "Generate one page per document using each document's :route."
+  (if (not (callable render))
+    (throw (TypeError "page renderer must be callable")))
+  (for [document documents]
+    (page (:route document) (render document) {:document document})))
+
+(defn append-page [pages value]
+  (cond
+    (= value nil) pages
+    (isinstance value Mapping) (conj pages value)
+    (or (isinstance value AbstractSet) (isinstance value str) (isinstance value bytes))
+      (throw (TypeError "pages must be page maps or deterministic sequences"))
+    (sequence-value? value) (reduce append-page pages value)
+    :else (throw (TypeError "pages must be page maps or deterministic sequences"))))
+
+(defn normalize-pages [values]
+  "Flatten page declarations while retaining deterministic order."
+  (append-page [] values))
+
+(defn route-table [pages]
+  "Return a route-to-page map and reject duplicate route ownership."
+  (reduce
+    (fn [table page-value]
+      (let [route (normalize-route (:route page-value))]
+        (if (contains? table route)
+          (throw (ValueError (fmt "duplicate static route: {}" route)))
+          (assoc table route (assoc page-value :route route)))))
+    {}
+    (normalize-pages pages)))

@@ -1,0 +1,176 @@
+;; Deterministic RSS 2.0 and Atom 1.0 feed generation.
+(ns spork-site.feeds
+  (:require
+    [spork-site.nodes :refer [sequence-value?]]
+    [spork-site.render :refer [render-html]]
+    [spork-site.xml :refer [absolute-url base-url iso-date rfc-2822-date
+                             utc-date-time xml-declaration xml-element
+                             xml-empty-element]])
+  (:import
+    [collections.abc :refer [Mapping]]))
+
+(defn feed-option
+  ([value key]
+   (feed-option value key nil))
+  ([value key default]
+   (cond
+     (and (isinstance value Mapping) (contains? value key)) (get value key)
+     (and (isinstance value Mapping)
+          (isinstance (get value :metadata) Mapping)
+          (contains? (get value :metadata) key))
+       (get (get value :metadata) key)
+     :else default)))
+
+(defn required-option [value key label]
+  (let [result (feed-option value key)]
+    (if (or (= result nil) (= result ""))
+      (throw (ValueError (fmt "{} requires {}" label key))))
+    result))
+
+(defn entry-date [entry]
+  (let [value (or (feed-option entry :updated)
+                  (feed-option entry :date)
+                  (feed-option entry :published))]
+    (if (= value nil)
+      (throw (ValueError "feed entries require :updated, :date, or :published")))
+    value))
+
+(defn included-entry? [entry]
+  (and (not (is (feed-option entry :draft false) true))
+       (not (is (feed-option entry :feed true) false))))
+
+(defn ordered-entries [entries]
+  (let [included (into [] (filter included-entry? entries))]
+    (into []
+      (sorted included
+              *{:key (fn [entry]
+                       (tuple [(utc-date-time (entry-date entry))
+                               (required-option entry :route "feed entry")]))
+                :reverse true}))))
+
+(defn feed-updated [config entries]
+  (let [explicit (feed-option config :updated)]
+    (cond
+      (not (= explicit nil)) explicit
+      (> (count entries) 0) (entry-date (first entries))
+      :else (throw (ValueError "an empty feed requires an explicit :updated value")))))
+
+(defn entry-url [site-url entry]
+  (absolute-url site-url (required-option entry :route "feed entry")))
+
+(defn entry-summary [entry]
+  (feed-option entry :summary (feed-option entry :description)))
+
+(defn entry-html [entry]
+  (let [content (feed-option entry :content)]
+    (if (= content nil) nil (render-html content))))
+
+(defn entry-tags [entry]
+  (let [tags (feed-option entry :tags [])]
+    (if (not (sequence-value? tags))
+      (throw (TypeError "feed :tags must be a deterministic sequence")))
+    tags))
+
+(defn rss-categories [entry]
+  (.join ""
+    (map (fn [tag] (+ "\n      " (xml-element "category" tag)))
+         (entry-tags entry))))
+
+(defn rss-item [site-url entry]
+  (let [url (entry-url site-url entry)
+        summary (entry-summary entry)
+        html (entry-html entry)
+        description (if (= summary nil) html summary)
+        author (feed-option entry :author)]
+    (+ "    <item>\n"
+       "      " (xml-element "title" (required-option entry :title "feed entry")) "\n"
+       "      " (xml-element "link" url) "\n"
+       "      " (xml-element "guid" {"isPermaLink" "true"} url) "\n"
+       "      " (xml-element "pubDate" (rfc-2822-date (entry-date entry)))
+       (if (= author nil) "" (+ "\n      " (xml-element "author" author)))
+       (if (= description nil) "" (+ "\n      " (xml-element "description" description)))
+       (rss-categories entry)
+       "\n    </item>")))
+
+(defn rss [config entries]
+  "Generate a deterministic RSS 2.0 document from content maps."
+  (if (not (isinstance config Mapping))
+    (throw (TypeError "feed config must be a map")))
+  (let [site-url (base-url (required-option config :url "feed config"))
+        title (required-option config :title "feed config")
+        description (required-option config :description "feed config")
+        feed-route (feed-option config :feed-route "/feed.xml")
+        ordered (ordered-entries entries)
+        updated (feed-updated config ordered)]
+    (+ xml-declaration
+       "\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n"
+       "  <channel>\n"
+       "    " (xml-element "title" title) "\n"
+       "    " (xml-element "link" site-url) "\n"
+       "    " (xml-element "description" description) "\n"
+       "    " (xml-element "lastBuildDate" (rfc-2822-date updated)) "\n"
+       "    " (xml-empty-element "atom:link"
+                    {"href" (absolute-url site-url feed-route)
+                     "rel" "self"
+                     "type" "application/rss+xml"})
+       (if (= (count ordered) 0)
+         ""
+         (+ "\n" (.join "\n" (map (fn [entry] (rss-item site-url entry)) ordered))))
+       "\n  </channel>\n</rss>\n")))
+
+(defn atom-categories [entry]
+  (.join ""
+    (map (fn [tag] (+ "\n      " (xml-empty-element "category" {"term" tag})))
+         (entry-tags entry))))
+
+(defn atom-entry [site-url entry]
+  (let [url (entry-url site-url entry)
+        summary (entry-summary entry)
+        html (entry-html entry)
+        author (feed-option entry :author)
+        published (feed-option entry :published)]
+    (+ "    <entry>\n"
+       "      " (xml-element "id" url) "\n"
+       "      " (xml-element "title" (required-option entry :title "feed entry")) "\n"
+       "      " (xml-element "updated" (iso-date (entry-date entry)))
+       (if (= published nil)
+         ""
+         (+ "\n      " (xml-element "published" (iso-date published))))
+       "\n      " (xml-empty-element "link" {"href" url "rel" "alternate"})
+       (if (= author nil)
+         ""
+         (+ "\n      <author>" (xml-element "name" author) "</author>"))
+       (if (= summary nil) "" (+ "\n      " (xml-element "summary" summary)))
+       (if (= html nil)
+         ""
+         (+ "\n      " (xml-element "content" {"type" "html"} html)))
+       (atom-categories entry)
+       "\n    </entry>")))
+
+(defn atom [config entries]
+  "Generate a deterministic Atom 1.0 document from content maps."
+  (if (not (isinstance config Mapping))
+    (throw (TypeError "feed config must be a map")))
+  (let [site-url (base-url (required-option config :url "feed config"))
+        title (required-option config :title "feed config")
+        feed-route (feed-option config :feed-route "/atom.xml")
+        ordered (ordered-entries entries)
+        updated (feed-updated config ordered)
+        author (feed-option config :author)]
+    (+ xml-declaration
+       "\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
+       "  " (xml-element "id" site-url) "\n"
+       "  " (xml-element "title" title) "\n"
+       "  " (xml-element "updated" (iso-date updated)) "\n"
+       "  " (xml-empty-element "link" {"href" site-url "rel" "alternate"}) "\n"
+       "  " (xml-empty-element "link"
+                {"href" (absolute-url site-url feed-route)
+                 "rel" "self"
+                 "type" "application/atom+xml"})
+       (if (= author nil)
+         ""
+         (+ "\n  <author>" (xml-element "name" author) "</author>"))
+       (if (= (count ordered) 0)
+         ""
+         (+ "\n" (.join "\n" (map (fn [entry] (atom-entry site-url entry)) ordered))))
+       "\n</feed>\n")))

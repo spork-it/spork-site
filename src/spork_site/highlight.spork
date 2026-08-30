@@ -1,0 +1,63 @@
+;; Syntax highlighting for structural Markdown code blocks.
+(ns spork-site.highlight
+  (:require
+    [spork-site.nodes :refer [Element RawHtml Text]]
+    [spork-site.transforms :refer [transform]])
+  (:import
+    [pygments :refer [highlight]]
+    [pygments.formatters :refer [HtmlFormatter]]
+    [pygments.lexers :refer [get_lexer_by_name]]
+    [pygments.util :refer [ClassNotFound]]))
+
+(def html-formatter (HtmlFormatter *{:nowrap true}))
+(def lexer-aliases {"spork" "clojure"})
+
+(defn language-from-class [class-value]
+  "Return the first language-* suffix in a normalized class string."
+  (if (not (isinstance class-value str))
+    nil
+    (some
+      (fn [class-name]
+        (if (.startswith class-name "language-")
+          (get class-name #[9 _])
+          nil))
+      (.split class-value))))
+
+(defn code-source [code-node]
+  "Return plain source text when a code element contains only Text nodes."
+  (if (and (isinstance code-node Element)
+           (= code-node.tag "code")
+           (every (fn [child] (isinstance child Text)) code-node.children))
+    (.join "" (map (fn [child] child.value) code-node.children))
+    nil))
+
+(defn highlighted-code [code-node language]
+  (try
+    (let [lexer (get_lexer_by_name (get lexer-aliases language language))
+          source (code-source code-node)
+          rendered (highlight source lexer html-formatter)
+          attrs (assoc code-node.attrs
+                       "class"
+                       [(get code-node.attrs "class") "highlight"])]
+      (Element "code" attrs [(RawHtml rendered)]))
+    (catch ClassNotFound error
+      code-node)))
+
+(defn highlight-node [node]
+  "Highlight a fenced pre/code node when Pygments knows its language."
+  (if (and (isinstance node Element)
+           (= node.tag "pre")
+           (= (count node.children) 1)
+           (isinstance (first node.children) Element)
+           (= (. (first node.children) tag) "code"))
+    (let [code-node (first node.children)
+          source (code-source code-node)
+          language (language-from-class (get code-node.attrs "class"))]
+      (if (or (= source nil) (= language nil) (= language ""))
+        node
+        (Element "pre" node.attrs [(highlighted-code code-node language)])))
+    node))
+
+(defn highlight-syntax [tree]
+  "Apply deterministic Pygments highlighting to fenced code blocks."
+  (transform tree highlight-node))

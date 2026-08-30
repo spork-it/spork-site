@@ -1,0 +1,111 @@
+;; Tests for deterministic sitemap, RSS, and Atom output.
+(ns spork-site.publishing-test
+  (:require
+    [spork-site.core :as site]
+    [spork-site.feeds :as feeds]
+    [spork-site.sitemap :as sitemap])
+  (:import
+    [xml.etree.ElementTree :as ET]))
+
+(defn raises? [expected-type function]
+  (try
+    (do (function) false)
+    (catch Exception error
+      (isinstance error expected-type))))
+
+(def entries
+  [{:title "Older & wiser"
+    :route "/blog/older/"
+    :date "2025-01-02T03:04:05Z"
+    :summary "Old <summary>"
+    :tags ["spork" "release"]
+    :content (site.element :p "Old body")
+    :changefreq :monthly
+    :priority 0.6}
+   {:title "Newest"
+    :route "/blog/newest/"
+    :date "2026-02-03T04:05:06+00:00"
+    :content (site.element :p "New <body>")
+    :lastmod "2026-02-04"}
+   {:title "Draft"
+    :route "/blog/draft/"
+    :date "2027-01-01"
+    :draft true
+    :sitemap false
+    :content (site.element :p "hidden")}])
+
+(def feed-config
+  {:title "Spork Blog"
+   :description "Spork news & releases"
+   :url "https://spork.sh"
+   :author "Spork Authors"})
+
+(deftest sitemap-is-valid-sorted-and-supports-standard-metadata
+  (def output (sitemap.sitemap "https://spork.sh" entries))
+  (assert (.startswith output "<?xml version=\"1.0\" encoding=\"utf-8\"?>"))
+  (assert (< (.index output "/blog/newest/") (.index output "/blog/older/")))
+  (assert (not (in "/blog/draft/" output)))
+  (assert (in "<lastmod>2026-02-04T00:00:00Z</lastmod>" output))
+  (assert (in "<changefreq>monthly</changefreq>" output))
+  (assert (in "<priority>0.6</priority>" output))
+  (def root (ET.fromstring output))
+  (assert (= (count (root.findall "{http://www.sitemaps.org/schemas/sitemap/0.9}url")) 2))
+  (assert (raises? ValueError
+                   (fn [] (sitemap.sitemap "not-absolute" entries))))
+  (assert (raises? ValueError
+                   (fn []
+                     (sitemap.sitemap "https://spork.sh"
+                       [{:route "/" :priority 2}]))))
+  (assert (raises? ValueError
+                   (fn []
+                     (sitemap.sitemap "https://spork.sh"
+                       [{:route "/same"} {:route "/same/"}])))))
+
+(deftest rss-is-valid-deterministic-and-excludes-drafts
+  (def first-output (feeds.rss feed-config entries))
+  (def second-output (feeds.rss feed-config entries))
+  (assert (= first-output second-output))
+  (assert (in "<lastBuildDate>Tue, 03 Feb 2026 04:05:06 GMT</lastBuildDate>"
+              first-output))
+  (assert (< (.index first-output "Newest")
+             (.index first-output "Older &amp; wiser")))
+  (assert (not (in "Draft" first-output)))
+  (assert (in "Old &lt;summary&gt;" first-output))
+  (assert (in "<category>release</category>" first-output))
+  (assert (in "&lt;p&gt;New &amp;lt;body&amp;gt;&lt;/p&gt;" first-output))
+  (def root (ET.fromstring first-output))
+  (def channel (root.find "channel"))
+  (assert (= (count (channel.findall "item")) 2)))
+
+(deftest atom-is-valid-and-carries-html-summary-tags-and-author
+  (def output (feeds.atom feed-config entries))
+  (assert (in "<updated>2026-02-03T04:05:06Z</updated>" output))
+  (assert (in "<author><name>Spork Authors</name></author>" output))
+  (assert (in "<category term=\"spork\"/>" output))
+  (assert (in "<content type=\"html\">&lt;p&gt;New &amp;lt;body&amp;gt;&lt;/p&gt;</content>"
+              output))
+  (assert (not (in "Draft" output)))
+  (def root (ET.fromstring output))
+  (assert (= (count (root.findall "{http://www.w3.org/2005/Atom}entry")) 2)))
+
+(deftest feeds-require-stable-dates-and-essential-metadata
+  (assert
+    (raises? ValueError
+      (fn []
+        (feeds.rss {:title "Missing URL" :description "x"}
+                   entries))))
+  (assert
+    (raises? ValueError
+      (fn []
+        (feeds.atom feed-config
+                    [{:title "No date" :route "/missing/"}]))))
+  (assert
+    (raises? ValueError
+      (fn []
+        (feeds.atom {:title "Empty" :url "https://example.com"} []))))
+  (def empty-feed
+    (feeds.atom {:title "Empty"
+                 :url "https://example.com"
+                 :updated "2026-01-01"}
+                []))
+  (assert (in "<updated>2026-01-01T00:00:00Z</updated>" empty-feed)))

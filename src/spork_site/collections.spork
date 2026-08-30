@@ -1,0 +1,42 @@
+;; Eager persistent document filtering and sorting.
+(ns spork-site.collections)
+
+(defn filter-documents [documents predicate]
+  "Return a persistent vector containing documents accepted by predicate."
+  (if (not (callable predicate))
+    (throw (TypeError "collection predicate must be callable")))
+  (into [] (filter predicate documents)))
+
+(defn sort-documents [documents key-function * (reverse? false)]
+  "Return a stable persistent vector ordered by a callable or keyword key."
+  (if (not (callable key-function))
+    (throw (TypeError "collection sort key must be callable")))
+  (into [] (sorted documents *{:key key-function :reverse (bool reverse?)})))
+
+(defn normalize-order [order]
+  (let [name
+        (cond
+          (isinstance order Keyword) order.name
+          (isinstance order str) (.lower order)
+          :else (throw (TypeError "collection order must be :asc or :desc")))]
+    (cond
+      (= name "asc") false
+      (= name "desc") true
+      :else (throw (ValueError "collection order must be :asc or :desc")))))
+
+(defn collection [documents * (where nil) (sort-by nil) (order :asc) (limit nil)]
+  "Build an eager persistent collection using ordinary predicates and sort keys."
+  (let [filtered (if (= where nil)
+                   (into [] documents)
+                   (filter-documents documents where))
+        ordered (if (= sort-by nil)
+                  filtered
+                  (sort-documents filtered sort-by
+                                  *{:reverse? (normalize-order order)}))]
+    (cond
+      (= limit nil) ordered
+      (not (isinstance limit int))
+        (throw (TypeError "collection limit must be an integer or nil"))
+      (< limit 0)
+        (throw (ValueError "collection limit cannot be negative"))
+      :else (into [] (take limit ordered)))))
