@@ -1,0 +1,53 @@
+;; Locally scoped $tag markup DSL.
+(ns spork-site.markup)
+
+(defmacro markup [& body]
+  "Lower $tag-headed forms while preserving all other Spork forms."
+  (let [walk
+        (fn [form]
+          (if (isinstance form list)
+            (if (and (> (len form) 0)
+                     (isinstance (nth form 0) Symbol)
+                     (or (= (. (nth form 0) name) "quote")
+                         (= (. (nth form 0) name) "quasiquote")))
+              form
+              (if (and (> (len form) 0)
+                       (isinstance (nth form 0) Symbol)
+                       (.startswith (. (nth form 0) name) "$")
+                       (> (len (. (nth form 0) name)) 1))
+                (let [tag (get (. (nth form 0) name) (slice 1 nil))
+                      children (list (map walk (rest form)))
+                      result (list)]
+                  (result.append (Symbol "element"))
+                  (result.append tag)
+                  (result.extend children)
+                  result)
+                (list (map walk form))))
+            (if (isinstance form VectorLiteral)
+              (VectorLiteral
+                (list (map walk form.items))
+                form.line form.col form.end-line form.end-col)
+              (if (isinstance form MapLiteral)
+                (MapLiteral
+                  (list
+                    (map
+                      (fn [pair]
+                        (tuple [(walk (nth pair 0))
+                                (walk (nth pair 1))]))
+                      form.pairs))
+                  form.line form.col form.end-line form.end-col)
+                (if (isinstance form SetLiteral)
+                  (SetLiteral
+                    (list (map walk form.items))
+                    form.line form.col form.end-line form.end-col)
+                  form)))))]
+    (if (= (len body) 0)
+      (let [result (list)]
+        (result.append (Symbol "fragment"))
+        result)
+      (if (= (len body) 1)
+        (walk (nth body 0))
+        (let [result (list)]
+          (result.append (Symbol "fragment"))
+          (result.extend (list (map walk body)))
+          result)))))

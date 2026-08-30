@@ -1,0 +1,19 @@
+;; Spork Project Manifest
+;; See https://github.com/spork-it/spork-lang/blob/main/docs/PROJECTS.md
+
+{:name "spork-site"
+ :version "0.1.0"
+ :description "Spork-native static site generation with immutable markup"
+ :requires-python ">=3.10"
+ :spork-version ">=0.5.1,<0.6"
+
+ ;; Dependencies (pip-style specifications)
+ :dependencies []
+ :dev-dependencies []
+
+ ;; Source code locations
+ :source-paths ["src"]
+ :test-paths ["tests"]
+
+ ;; Entry point for 'spork run'
+ :main "spork-site.core:main"}

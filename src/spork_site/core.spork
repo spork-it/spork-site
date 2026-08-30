@@ -1,0 +1,21 @@
+;; Public milestone-0 API and smoke-test entrypoint.
+(ns spork-site.core
+  (:require
+    [spork-site.nodes :refer [Element Fragment RawHtml Text
+                               attribute-name element fragment named-value
+                               normalize-attrs normalize-children normalize-class
+                               normalize-style normalize-style-map raw-html
+                               scalar-string sequence-value? tag-name text]]
+    [spork-site.render :refer [escape-attribute escape-text
+                                render-attributes render-html serialize]]
+    [spork-site.markup :refer [markup]]))
+
+(defn ^int main [& args]
+  "Render a tiny document as a command-line smoke test."
+  (print
+    (render-html
+      (markup
+        ($main {:class "content"}
+          ($h1 "spork-site")
+          ($p "Immutable markup from ordinary Spork.")))))
+  0)

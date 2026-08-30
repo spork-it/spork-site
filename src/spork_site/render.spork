@@ -1,0 +1,61 @@
+;; Deterministic HTML serialization.
+(ns spork-site.render
+  (:require
+    [spork-site.nodes :refer [Element Fragment RawHtml Text
+                               scalar-string sequence-value?]])
+  (:import
+    [collections.abc :refer [Mapping Set :as AbstractSet]]
+    [html :as html-lib]))
+
+(def void-tags
+  (frozenset ["area" "base" "br" "col" "embed" "hr" "img" "input"
+              "link" "meta" "param" "source" "track" "wbr"]))
+
+(defn escape-text [value]
+  "Escape text content while leaving quotes readable in normal text nodes."
+  (html-lib.escape (scalar-string value) false))
+
+(defn escape-attribute [value]
+  "Escape an attribute value, including both quote characters."
+  (html-lib.escape (scalar-string value) true))
+
+(defn render-attribute [pair]
+  (let [name (nth pair 0)
+        value (nth pair 1)]
+    (if (is value true)
+      (+ " " name)
+      (+ " " name "=\"" (escape-attribute value) "\""))))
+
+(defn render-attributes [attrs]
+  "Serialize normalized attributes in lexical name order."
+  (let [entries (sorted (attrs.items) *{:key first})]
+    (.join "" (map render-attribute entries))))
+
+(defn render-html [value]
+  "Serialize a node-like value to deterministic HTML."
+  (cond
+    (= value nil) ""
+    (isinstance value Text) (escape-text value.value)
+    (isinstance value RawHtml) value.value
+    (isinstance value Fragment)
+      (.join "" (map render-html value.children))
+    (isinstance value Element)
+      (let [tag value.tag
+            attrs (render-attributes value.attrs)
+            opening (+ "<" tag attrs ">")]
+        (if (contains? void-tags tag)
+          (if (= (count value.children) 0)
+            opening
+            (throw (ValueError (fmt "void element <{}> cannot have children" tag))))
+          (+ opening
+             (.join "" (map render-html value.children))
+             "</" tag ">")))
+    (or (isinstance value Mapping) (isinstance value AbstractSet))
+      (throw (TypeError "cannot serialize maps or unordered sets as markup"))
+    (sequence-value? value)
+      (.join "" (map render-html value))
+    :else (escape-text value)))
+
+(defn serialize [value]
+  "Alias for render-html."
+  (render-html value))

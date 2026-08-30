@@ -1,0 +1,30 @@
+# Spork project artifacts
+.venv/
+target/
+dist/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# REPL history
+.spork_history
+.nrepl-port
+
+# Spork builds
+.spork-out/

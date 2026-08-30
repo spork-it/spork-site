@@ -1,0 +1,207 @@
+;; Milestone-0 tests for immutable markup, the DSL, and serialization.
+(ns spork-site.core-test
+  (:require [spork-site.core :as site :refer [element fragment markup]]))
+
+(defn raises? [expected-type function]
+  (try
+    (do
+      (function)
+      false)
+    (catch Exception error
+      (isinstance error expected-type))))
+
+(defn badge [label]
+  (markup
+    ($span {:class "badge"} label)))
+
+(defn mutate-text-value [node]
+  (set! node.value "changed"))
+
+(deftest element-construction-is-structural
+  (def node (site.element :article {:id "intro"} "hello" 42 nil))
+  (assert (isinstance node site.Element))
+  (assert (= node.tag "article"))
+  (assert (= (get node.attrs "id") "intro"))
+  (assert (= (count node.children) 2))
+  (assert (isinstance (nth node.children 0) site.Text))
+  (assert (= (. (nth node.children 0) value) "hello"))
+  (assert (= (. (nth node.children 1) value) "42")))
+
+(deftest nodes-are-immutable-and-structurally-equal
+  (def left (site.element :p {:class "lead"} "hello"))
+  (def right (site.element "p" {"class" "lead"} (site.text "hello")))
+  (assert (= left right))
+  (assert (= (hash left) (hash right)))
+  (assert (raises? AttributeError (fn [] (set! left.tag "div"))))
+  (assert
+    (raises? AttributeError
+             (fn [] (mutate-text-value (first left.children))))))
+
+(deftest fragments-and-sequences-flatten-recursively
+  (def result
+    (site.fragment
+      (site.text "a")
+      [(site.fragment "b" nil) ["c"]]
+      (map str [1 2])))
+  (assert (isinstance result site.Fragment))
+  (assert (= (count result.children) 5))
+  (assert (= (mapv (fn [node] node.value) result.children)
+             ["a" "b" "c" "1" "2"]))
+  (def direct (site.Fragment "one child"))
+  (assert (= (count direct.children) 1))
+  (assert (= (. (first direct.children) value) "one child")))
+
+(deftest nil-disappears-and-scalars-become-text
+  (def node (site.element :div {} nil true false 0 :ready))
+  (assert (= (mapv (fn [child] child.value) node.children)
+             ["true" "false" "0" "ready"]))
+  (assert (= (site.render-html nil) "")))
+
+(deftest map-and-set-children-are-rejected
+  (assert (raises? TypeError
+                   (fn [] (site.element :div {} {:unexpected "map"}))))
+  (assert (raises? TypeError
+                   (fn [] (site.element :div {} #{1 2 3}))))
+  (assert (raises? TypeError
+                   (fn [] (site.render-html {:unexpected "map"})))))
+
+(deftest classes-normalize-nested-values
+  (assert (= (site.normalize-class
+               ["button" [nil "primary" [7]] "  active  "])
+             "button primary 7 active"))
+  (assert (= (site.normalize-class [nil "" "   "]) nil))
+  (assert (raises? TypeError
+                   (fn [] (site.normalize-class #{"unordered"})))))
+
+(deftest style-maps-serialize-deterministically
+  (assert (= (site.normalize-style
+               {:z-index 2 :display "grid" :max-width "72ch" :unused nil})
+             "display:grid;max-width:72ch;z-index:2"))
+  (assert (= (site.normalize-style "display:block") "display:block"))
+  (assert (raises? TypeError (fn [] (site.normalize-style ["not" "css"]))))
+  (assert (raises? ValueError
+                   (fn [] (site.normalize-style
+                            {:display "grid" "display" "block"})))))
+
+(deftest attributes-normalize-and-omit-empty-values
+  (def node
+    (site.element
+      :button
+      {:class ["button" nil ["primary"]]
+       :style {:gap "1rem" :display "grid"}
+       :disabled true
+       :hidden false
+       :title nil
+       :tabindex 1}
+      "Go"))
+  (assert (= (get node.attrs "class") "button primary"))
+  (assert (= (get node.attrs "style") "display:grid;gap:1rem"))
+  (assert (= (get node.attrs "disabled") true))
+  (assert (= (get node.attrs "tabindex") "1"))
+  (assert (not (contains? node.attrs "hidden")))
+  (assert (not (contains? node.attrs "title")))
+  (assert (raises? ValueError
+                   (fn [] (site.element :div {:id "a" "id" "b"})))))
+
+(deftest text-and-raw-html-have-explicit-escaping-rules
+  (def node
+    (site.element :p {}
+      "<&> \"quoted\""
+      (site.raw-html "<em>trusted</em>")))
+  (assert (= (site.render-html node)
+             "<p>&lt;&amp;&gt; \"quoted\"<em>trusted</em></p>"))
+  (assert (raises? TypeError (fn [] (site.raw-html 42)))))
+
+(deftest attributes-are-sorted-and-escaped
+  (def node
+    (site.element :input
+      {:title "A&B\"'<>"
+       :disabled true
+       :hidden false
+       :data-count 2}))
+  (assert (= (site.render-html node)
+             "<input data-count=\"2\" disabled title=\"A&amp;B&quot;&#x27;&lt;&gt;\">")))
+
+(deftest normal-and-custom-elements-serialize
+  (assert (= (site.render-html (site.element :div "hello"))
+             "<div>hello</div>"))
+  (assert (= (site.render-html
+               (site.element "spork-playground" {:source "(+ 1 2)"}))
+             "<spork-playground source=\"(+ 1 2)\"></spork-playground>"))
+  (assert (= (site.render-html (site.element :meta {:charset "utf-8"}))
+             "<meta charset=\"utf-8\">")))
+
+(deftest invalid-elements-and-attributes-fail-clearly
+  (assert (raises? ValueError (fn [] (site.element "bad tag"))))
+  (assert (raises? ValueError
+                   (fn [] (site.element :div {"bad name" "value"}))))
+  (assert (raises? ValueError
+                   (fn [] (site.render-html (site.element :br "child"))))))
+
+(deftest markup-lowers-tags-and-nests-elements
+  (def node
+    (markup
+      ($article {:class "post"}
+        ($h2 "Hello")
+        ($p "A post."))))
+  (assert (isinstance node site.Element))
+  (assert (= node.tag "article"))
+  (assert (= (. (first node.children) tag) "h2"))
+  (assert (= (site.render-html node)
+             "<article class=\"post\"><h2>Hello</h2><p>A post.</p></article>")))
+
+(deftest markup-supports-empty-single-and-multiple-roots
+  (def empty-result (markup))
+  (def single-result (markup ($span "one")))
+  (def multiple-result (markup ($h1 "Title") ($p "Body")))
+  (assert (isinstance empty-result site.Fragment))
+  (assert (= (count empty-result.children) 0))
+  (assert (isinstance single-result site.Element))
+  (assert (isinstance multiple-result site.Fragment))
+  (assert (= (site.render-html multiple-result) "<h1>Title</h1><p>Body</p>")))
+
+(deftest components-and-conditionals-remain-ordinary-spork
+  (def node
+    (markup
+      ($div
+        (badge "new")
+        (when true ($strong "shown"))
+        (when false ($strong "hidden")))))
+  (assert (= (site.render-html node)
+             "<div><span class=\"badge\">new</span><strong>shown</strong></div>")))
+
+(deftest vector-comprehensions-compose-as-child-sequences
+  (def items ["one" "two" "three"])
+  (def node
+    (markup
+      ($ul
+        [for [item items]
+          ($li item)])))
+  (assert (= (site.render-html node)
+             "<ul><li>one</li><li>two</li><li>three</li></ul>")))
+
+(deftest quoted-forms-are-not-reinterpreted-as-tags
+  (assert (= (site.render-html (markup (str '$div))) "$div")))
+
+(deftest dsl-and-low-level-construction-are-equivalent
+  (assert (= (markup ($a {:href "/docs/"} "Docs"))
+             (site.element :a {:href "/docs/"} "Docs"))))
+
+(deftest qualified-markup-macro-calls-work
+  (assert (= (site.render-html (site.markup ($spork-badge "new")))
+             "<spork-badge>new</spork-badge>")))
+
+(deftest north-star-homepage-renders
+  (def posts
+    [{:title "First" :summary "One"}
+     {:title "Second" :summary "Two"}])
+  (def page
+    (markup
+      ($main {:class "content"}
+        ($h1 "Spork")
+        [for [post posts]
+          ($article {:class "post"}
+            ($h2 (:title post))
+            ($p (:summary post)))])))
+  (assert (= (site.serialize page)
+             "<main class=\"content\"><h1>Spork</h1><article class=\"post\"><h2>First</h2><p>One</p></article><article class=\"post\"><h2>Second</h2><p>Two</p></article></main>")))

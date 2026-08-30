@@ -1,0 +1,263 @@
+;; Immutable markup nodes and normalization.
+(ns spork-site.nodes
+  (:import
+    [collections.abc :refer [Iterable Mapping Set :as AbstractSet]]
+    [re :as re]))
+
+(def tag-pattern (re.compile "^[A-Za-z][A-Za-z0-9._:-]*$"))
+(def attribute-pattern (re.compile "^[^\\s\"'<>/=]+$"))
+(def omit-attribute (object))
+
+(defn named-value [value kind]
+  "Return the source name of a keyword, symbol, or string."
+  (cond
+    (isinstance value str) value
+    (isinstance value Keyword) value.name
+    (isinstance value Symbol) value.name
+    :else (throw (TypeError (fmt "{} must be a string, keyword, or symbol; got {}"
+                                  kind
+                                  (. (type value) __name__))))))
+
+(defn scalar-string [value]
+  "Use deterministic, HTML-friendly spelling for scalar values."
+  (cond
+    (is value true) "true"
+    (is value false) "false"
+    (isinstance value Keyword) value.name
+    (isinstance value Symbol) value.name
+    :else (str value)))
+
+(defn tag-name [tag]
+  "Normalize and validate an HTML or custom-element tag name."
+  (let [name (named-value tag "tag")]
+    (if (tag-pattern.fullmatch name)
+      name
+      (throw (ValueError (fmt "invalid markup tag name: {}" (repr name)))))))
+
+(defn attribute-name [key]
+  "Normalize and validate an attribute name."
+  (let [name (named-value key "attribute name")]
+    (if (attribute-pattern.fullmatch name)
+      name
+      (throw (ValueError (fmt "invalid markup attribute name: {}" (repr name)))))))
+
+(defn sequence-value? [value]
+  "True for deterministic child/class sequences, excluding text and mappings."
+  (and (isinstance value Iterable)
+       (not (isinstance value str))
+       (not (isinstance value bytes))
+       (not (isinstance value Mapping))
+       (not (isinstance value AbstractSet))))
+
+(defn append-class-values [parts value]
+  (cond
+    (= value nil) parts
+    (sequence-value? value)
+      (reduce append-class-values parts value)
+    (or (isinstance value Mapping) (isinstance value AbstractSet))
+      (throw (TypeError "class values must be scalars or deterministic sequences"))
+    :else
+      (let [part (.strip (scalar-string value))]
+        (if (= part "") parts (conj parts part)))))
+
+(defn normalize-class [value]
+  "Flatten a structured class value into a stable space-delimited string."
+  (let [parts (append-class-values [] value)]
+    (if (= (count parts) 0)
+      nil
+      (.join " " parts))))
+
+(defn normalize-style-map [style-map]
+  (let [entries (sorted (style-map.items)
+                        *{:key (fn [pair] (attribute-name (nth pair 0)))})]
+    (loop [seen #{}
+           rendered []
+           remaining (seq entries)]
+      (if (= remaining nil)
+        (let [result (.join ";" rendered)]
+          (if (= result "") nil result))
+        (let [pair (first remaining)
+              name (attribute-name (nth pair 0))
+              value (nth pair 1)]
+          (if (contains? seen name)
+            (throw (ValueError (fmt "duplicate normalized style property: {}" name)))
+            (recur
+              (conj seen name)
+              (if (= value nil)
+                rendered
+                (conj rendered (+ name ":" (scalar-string value))))
+              (rest remaining))))))))
+
+(defn normalize-style [value]
+  "Normalize a CSS string or serialize a style map in key order."
+  (cond
+    (= value nil) nil
+    (isinstance value str) value
+    (isinstance value Mapping) (normalize-style-map value)
+    :else
+      (throw (TypeError "style must be a string, map, or nil"))))
+
+(defn normalize-attribute-value [name value]
+  (cond
+    (= value nil) omit-attribute
+    (is value false) omit-attribute
+    (= name "class")
+      (let [classes (normalize-class value)]
+        (if (= classes nil) omit-attribute classes))
+    (= name "style")
+      (let [style (normalize-style value)]
+        (if (= style nil) omit-attribute style))
+    (is value true) true
+    (or (isinstance value Mapping)
+        (isinstance value AbstractSet)
+        (sequence-value? value))
+      (throw (TypeError (fmt "attribute '{}' must have a scalar value" name)))
+    :else (scalar-string value)))
+
+(defn normalize-attrs [attrs]
+  "Return an immutable map with normalized names and values."
+  (cond
+    (= attrs nil) {}
+    (not (isinstance attrs Mapping))
+      (throw (TypeError "element attributes must be a map or nil"))
+    :else
+      (loop [result {}
+             seen #{}
+             entries (seq (attrs.items))]
+        (if (= entries nil)
+          result
+          (let [pair (first entries)
+                name (attribute-name (nth pair 0))
+                value (normalize-attribute-value name (nth pair 1))]
+            (if (contains? seen name)
+              (throw (ValueError (fmt "duplicate normalized attribute name: {}" name)))
+              (recur
+                (if (is value omit-attribute)
+                  result
+                  (assoc result name value))
+                (conj seen name)
+                (rest entries))))))))
+
+;; These helpers resolve node class names when called, after module loading.
+(defn append-normalized-child [children value]
+  (cond
+    (= value nil) children
+    (isinstance value Fragment)
+      (reduce append-normalized-child children value.children)
+    (or (isinstance value Element)
+        (isinstance value Text)
+        (isinstance value RawHtml))
+      (conj children value)
+    (or (isinstance value Mapping) (isinstance value AbstractSet))
+      (throw (TypeError "markup children cannot be maps or unordered sets"))
+    (sequence-value? value)
+      (reduce append-normalized-child children value)
+    :else
+      (conj children (Text (scalar-string value)))))
+
+(defn normalize-children [values]
+  "Flatten fragments and deterministic sequences into an immutable node vector."
+  (cond
+    (= values nil) []
+    (sequence-value? values) (reduce append-normalized-child [] values)
+    :else (append-normalized-child [] values)))
+
+(defclass Text []
+  (def __slots__ (tuple ["value"]))
+
+  (defn __init__ [self value]
+    (object.__setattr__ self "value" (scalar-string value)))
+
+  (defn __setattr__ [self name value]
+    (throw (AttributeError "Text nodes are immutable")))
+
+  (defn __eq__ [self other]
+    (and (isinstance other Text) (= self.value other.value)))
+
+  (defn __hash__ [self]
+    (hash (tuple ["Text" self.value])))
+
+  (defn __repr__ [self]
+    (fmt "Text({})" (repr self.value))))
+
+(defclass RawHtml []
+  (def __slots__ (tuple ["value"]))
+
+  (defn __init__ [self value]
+    (if (not (isinstance value str))
+      (throw (TypeError "raw HTML must be a string")))
+    (object.__setattr__ self "value" value))
+
+  (defn __setattr__ [self name value]
+    (throw (AttributeError "RawHtml nodes are immutable")))
+
+  (defn __eq__ [self other]
+    (and (isinstance other RawHtml) (= self.value other.value)))
+
+  (defn __hash__ [self]
+    (hash (tuple ["RawHtml" self.value])))
+
+  (defn __repr__ [self]
+    (fmt "RawHtml({})" (repr self.value))))
+
+(defclass Fragment []
+  (def __slots__ (tuple ["children"]))
+
+  (defn __init__ [self children]
+    (object.__setattr__ self "children" (normalize-children children)))
+
+  (defn __setattr__ [self name value]
+    (throw (AttributeError "Fragment nodes are immutable")))
+
+  (defn __eq__ [self other]
+    (and (isinstance other Fragment) (= self.children other.children)))
+
+  (defn __hash__ [self]
+    (hash (tuple ["Fragment" self.children])))
+
+  (defn __repr__ [self]
+    (fmt "Fragment({})" (repr self.children))))
+
+(defclass Element []
+  (def __slots__ (tuple ["tag" "attrs" "children"]))
+
+  (defn __init__ [self tag attrs children]
+    (object.__setattr__ self "tag" (tag-name tag))
+    (object.__setattr__ self "attrs" (normalize-attrs attrs))
+    (object.__setattr__ self "children" (normalize-children children)))
+
+  (defn __setattr__ [self name value]
+    (throw (AttributeError "Element nodes are immutable")))
+
+  (defn __eq__ [self other]
+    (and (isinstance other Element)
+         (= self.tag other.tag)
+         (= self.attrs other.attrs)
+         (= self.children other.children)))
+
+  (defn __hash__ [self]
+    (hash (tuple ["Element" self.tag self.attrs self.children])))
+
+  (defn __repr__ [self]
+    (fmt "Element(tag={}, attrs={}, children={})"
+         (repr self.tag) (repr self.attrs) (repr self.children))))
+
+(defn text [value]
+  "Construct an escaped text node."
+  (Text value))
+
+(defn raw-html [value]
+  "Construct an explicit unescaped HTML node."
+  (RawHtml value))
+
+(defn fragment [& children]
+  "Construct a flattened fragment from zero or more child-like values."
+  (Fragment children))
+
+(defn element [tag & content]
+  "Construct an immutable element. The first content value is attrs when it is a map."
+  (let [has-attrs (and (> (count content) 0)
+                       (isinstance (first content) Mapping))
+        attrs (if has-attrs (first content) {})
+        children (if has-attrs (rest content) content)]
+    (Element tag attrs children)))
