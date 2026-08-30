@@ -9,6 +9,7 @@
     [contextlib :refer [redirect_stderr redirect_stdout]]
     [io :refer [StringIO]]
     [json :refer [loads]]
+    [os.path :refer [normcase realpath]]
     [pathlib :refer [Path]]
     [tempfile :refer [TemporaryDirectory]]
     [types :refer [SimpleNamespace]]))
@@ -59,7 +60,10 @@
     (def checked (loads (check-stream.getvalue)))
     (assert (= (get checked "pages") 1))
     (assert (= (get checked "assets") 0))
-    (assert (= (get checked "output") (str (.resolve output))))
+    (def reported-output (Path (get checked "output")))
+    (assert (reported-output.is-absolute))
+    (assert (= (normcase (realpath reported-output))
+               (normcase (realpath output))))
     (assert (not (output.exists)))
     (def routes-stream (StringIO))
     (with [capture (redirect_stdout routes-stream)]
