@@ -100,9 +100,29 @@ jobs:
               raise SystemExit(f"generated package is missing: {missing}")
 
       - name: Smoke-test generated Python package
-        env:
-          PYTHONPATH: .spork-out
-        run: >-
-          python -c "from spork_site.markdown import render;
-          from spork_site.render import render_html;
-          assert render_html(render('# Hello\n')) == '<h1>Hello</h1>'"
+        shell: python
+        run: |
+          import os
+          import subprocess
+          from pathlib import Path
+
+          candidates = [Path(".venv/bin/python"), Path(".venv/Scripts/python.exe")]
+          project_python = next(
+              (candidate for candidate in candidates if candidate.is_file()), None
+          )
+          if project_python is None:
+              raise SystemExit("could not find the project virtualenv interpreter")
+
+          environment = os.environ.copy()
+          environment["PYTHONPATH"] = str(Path(".spork-out").resolve())
+          subprocess.run(
+              [
+                  str(project_python),
+                  "-c",
+                  "from spork_site.markdown import render; "
+                  "from spork_site.render import render_html; "
+                  "assert render_html(render('# Hello\\n')) == '<h1>Hello</h1>'",
+              ],
+              check=True,
+              env=environment,
+          )
