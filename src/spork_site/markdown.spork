@@ -1,0 +1,137 @@
+;; CommonMark parsing and conversion into the shared immutable node model.
+(ns spork-site.markdown
+  (:require
+    [spork-site.nodes :refer [Element Fragment RawHtml Text]])
+  (:import
+    [markdown_it :refer [MarkdownIt]]
+    [markdown_it.common.utils :refer [unescapeAll]]
+    [markdown_it.tree :refer [SyntaxTreeNode]]
+    [pathlib :refer [Path]]))
+
+(defn ensure-source [source]
+  (if (not (isinstance source str))
+    (throw (TypeError "Markdown source must be a string")))
+  source)
+
+(defn make-parser
+  ([] (make-parser true))
+  ([allow-html?]
+   (MarkdownIt "commonmark" {"html" (bool allow-html?)})))
+
+(def default-parser (make-parser))
+
+(defn parse-with [parser source]
+  "Parse Markdown with parser and return a markdown-it syntax tree."
+  (if (not (isinstance parser MarkdownIt))
+    (throw (TypeError "parser must be a markdown_it.MarkdownIt instance")))
+  (SyntaxTreeNode (parser.parse (ensure-source source))))
+
+(defn parse [source]
+  "Parse CommonMark source into a markdown-it SyntaxTreeNode AST."
+  (parse-with default-parser source))
+
+(defn child-text [node]
+  "Extract CommonMark's plain-text representation for image alt text."
+  (cond
+    (= node.type "text") node.content
+    (= node.type "softbreak") "\n"
+    (= node.type "image") (.join "" (map child-text node.children))
+    (> (count node.children) 0) (.join "" (map child-text node.children))
+    :else ""))
+
+(defn fence-language [info]
+  (let [cleaned (.strip (unescapeAll info))]
+    (if (= cleaned "")
+      nil
+      (first (.split cleaned)))))
+
+(defn fence-code-attrs [node]
+  (let [language (fence-language node.info)]
+    (if (= language nil)
+      node.attrs
+      (let [existing (get node.attrs "class")
+            language-class (+ "language-" language)
+            classes (if (= existing nil)
+                      language-class
+                      [existing language-class])]
+        (assoc node.attrs "class" classes)))))
+
+(defn unsupported-token [node]
+  (throw
+    (ValueError
+      (fmt "unsupported Markdown token type '{}' with no HTML tag" node.type))))
+
+(defn markdown-node [node]
+  "Convert one markdown-it syntax-tree node to a shared markup node."
+  (cond
+    node.is-root
+      (Fragment (map markdown-node node.children))
+
+    (= node.type "inline")
+      (Fragment (map markdown-node node.children))
+
+    node.hidden
+      (Fragment (map markdown-node node.children))
+
+    node.is-nested
+      (if (= node.tag "")
+        (unsupported-token node)
+        (Element node.tag node.attrs (map markdown-node node.children)))
+
+    (= node.type "text")
+      (Text node.content)
+
+    (= node.type "text_special")
+      (Text node.content)
+
+    (= node.type "softbreak")
+      (Text "\n")
+
+    (= node.type "hardbreak")
+      (Element "br" {} [])
+
+    (= node.type "code_inline")
+      (Element "code" node.attrs [node.content])
+
+    (= node.type "code_block")
+      (Element "pre" node.attrs [(Element "code" {} [node.content])])
+
+    (= node.type "fence")
+      (Element "pre" {} [(Element "code" (fence-code-attrs node) [node.content])])
+
+    (= node.type "image")
+      (Element "img" (assoc node.attrs "alt" (child-text node)) [])
+
+    (or (= node.type "html_inline") (= node.type "html_block"))
+      (RawHtml node.content)
+
+    (= node.type "hr")
+      (Element "hr" node.attrs [])
+
+    (not (= node.tag ""))
+      (Element node.tag node.attrs
+               (if (= node.content "") [] [node.content]))
+
+    :else (unsupported-token node)))
+
+(defn ast-to-nodes [ast]
+  "Convert a markdown-it AST into a Fragment of immutable markup nodes."
+  (if (not (isinstance ast SyntaxTreeNode))
+    (throw (TypeError "Markdown AST must be a markdown_it.tree.SyntaxTreeNode")))
+  (let [converted (markdown-node ast)]
+    (if (isinstance converted Fragment)
+      converted
+      (Fragment [converted]))))
+
+(defn render-with [parser source]
+  "Parse Markdown with parser and return a Fragment in the shared node model."
+  (ast-to-nodes (parse-with parser source)))
+
+(defn render [source]
+  "Parse CommonMark source and return a Fragment in the shared node model."
+  (render-with default-parser source))
+
+(defn render-file [path]
+  "Read a UTF-8 Markdown file and return its rendered Fragment."
+  (let [source-path (Path path)]
+    (render (source-path.read-text *{:encoding "utf-8"}))))

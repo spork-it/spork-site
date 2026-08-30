@@ -1,0 +1,154 @@
+;; Tests for CommonMark parsing and shared-node conversion.
+(ns spork-site.markdown-test
+  (:require
+    [spork-site.core :as site :refer [element markup]]
+    [spork-site.markdown :as markdown])
+  (:import
+    [markdown_it.tree :refer [SyntaxTreeNode]]
+    [pathlib :refer [Path]]
+    [tempfile :refer [TemporaryDirectory]]))
+
+(defn raises? [expected-type function]
+  (try
+    (do
+      (function)
+      false)
+    (catch Exception error
+      (isinstance error expected-type))))
+
+(defn edit-page-link [page]
+  (markup
+    ($a {:class "edit-link" :href (:edit-url page)} "Edit this page")))
+
+(deftest parse-exposes-markdown-ast-and-converts-to-fragment
+  (def ast (markdown.parse "# Hello\n"))
+  (assert (isinstance ast SyntaxTreeNode))
+  (assert ast.is-root)
+  (assert (= (. (first ast.children) type) "heading"))
+  (def nodes (markdown.ast-to-nodes ast))
+  (assert (isinstance nodes site.Fragment))
+  (assert (= (count nodes.children) 1))
+  (assert (= (. (first nodes.children) tag) "h1"))
+  (assert (raises? TypeError (fn [] (markdown.parse 42))))
+  (assert (raises? TypeError (fn [] (markdown.ast-to-nodes "not an AST"))))
+  (assert (raises? TypeError (fn [] (markdown.parse-with nil "text")))))
+
+(deftest render-always-returns-a-fragment
+  (def empty-result (markdown.render ""))
+  (def single-result (markdown.render "one paragraph"))
+  (def multiple-result (markdown.render "# One\n\nTwo\n"))
+  (assert (isinstance empty-result site.Fragment))
+  (assert (isinstance single-result site.Fragment))
+  (assert (isinstance multiple-result site.Fragment))
+  (assert (= (count empty-result.children) 0))
+  (assert (= (count single-result.children) 1))
+  (assert (= (count multiple-result.children) 2)))
+
+(deftest commonmark-blocks-become-ordinary-elements
+  (def source
+    "# Heading *em*\n\n> Quote **bold**\n\n- one\n- two\n\n3. three\n4. four\n")
+  (def result (markdown.render source))
+  (assert (= (site.render-html result)
+             "<h1>Heading <em>em</em></h1><blockquote><p>Quote <strong>bold</strong></p></blockquote><ul><li>one</li><li>two</li></ul><ol start=\"3\"><li>three</li><li>four</li></ol>"))
+  (def heading (first result.children))
+  (assert (isinstance heading site.Element))
+  (assert (= heading.tag "h1"))
+  (assert (isinstance (nth heading.children 1) site.Element)))
+
+(deftest inline-markdown-is-structural-and-escaped-on-serialization
+  (def result
+    (markdown.render
+      "A [link](https://example.com/?a=1&b=2 \"Title\") and `<&>`.\nsoft  \nhard\n"))
+  (assert (= (site.render-html result)
+             "<p>A <a href=\"https://example.com/?a=1&amp;b=2\" title=\"Title\">link</a> and <code>&lt;&amp;&gt;</code>.\nsoft<br>hard</p>"))
+  (def paragraph (first result.children))
+  (assert (= paragraph.tag "p"))
+  (assert (some (fn [node]
+                  (and (isinstance node site.Element) (= node.tag "a")))
+                paragraph.children))
+  (assert (some (fn [node]
+                  (and (isinstance node site.Element) (= node.tag "br")))
+                paragraph.children)))
+
+(deftest images-have-plain-alt-text-and-normal-attributes
+  (def result
+    (markdown.render "![Spork *logo*](logo.png \"Project <logo>\")\n"))
+  (def image (first (. (first result.children) children)))
+  (assert (isinstance image site.Element))
+  (assert (= image.tag "img"))
+  (assert (= (get image.attrs "alt") "Spork logo"))
+  (assert (= (site.render-html result)
+             "<p><img alt=\"Spork logo\" src=\"logo.png\" title=\"Project &lt;logo&gt;\"></p>")))
+
+(deftest entities-autolinks-and-thematic-breaks-follow-commonmark
+  (def result
+    (markdown.render "&copy; &amp; <https://spork.sh/>\n\n---\n"))
+  (assert (= (site.render-html result)
+             "<p>© &amp; <a href=\"https://spork.sh/\">https://spork.sh/</a></p><hr>"))
+  (assert (= (. (nth result.children 1) tag) "hr")))
+
+(deftest configured-markdown-it-container-tokens-convert-generically
+  (def parser (markdown.make-parser))
+  (parser.enable ["table" "strikethrough"])
+  (def result
+    (markdown.render-with
+      parser
+      "| Name | Value |\n| --- | ---: |\n| ~~old~~ | 2 |\n"))
+  (assert (= (site.render-html result)
+             "<table><thead><tr><th>Name</th><th style=\"text-align:right\">Value</th></tr></thead><tbody><tr><td><s>old</s></td><td style=\"text-align:right\">2</td></tr></tbody></table>"))
+  (assert (= (. (first result.children) tag) "table")))
+
+(deftest fenced-and-indented-code-use-structural-pre-and-code-nodes
+  (def fenced (markdown.render "```spork extra\n(<tag> & value)\n```\n"))
+  (def indented (markdown.render "    <plain>\n"))
+  (assert (= (site.render-html fenced)
+             "<pre><code class=\"language-spork\">(&lt;tag&gt; &amp; value)\n</code></pre>"))
+  (assert (= (site.render-html indented)
+             "<pre><code>&lt;plain&gt;\n</code></pre>"))
+  (def pre (first fenced.children))
+  (def code (first pre.children))
+  (assert (= pre.tag "pre"))
+  (assert (= code.tag "code"))
+  (assert (= (get code.attrs "class") "language-spork")))
+
+(deftest markdown-html-becomes-explicit-raw-html-nodes
+  (def result
+    (markdown.render
+      "Before <mark>raw & trusted</mark> after.\n\n<section data-x=\"1\">block & raw</section>\n"))
+  (def paragraph (first result.children))
+  (assert (some #(isinstance % site.RawHtml) paragraph.children))
+  (assert (isinstance (nth result.children 1) site.RawHtml))
+  (assert (= (site.render-html result)
+             "<p>Before <mark>raw &amp; trusted</mark> after.</p><section data-x=\"1\">block & raw</section>\n"))
+  (def safe-result
+    (markdown.render-with (markdown.make-parser false) "<b>escaped</b>\n"))
+  (assert (= (site.render-html safe-result)
+             "<p>&lt;b&gt;escaped&lt;/b&gt;</p>")))
+
+(deftest markdown-and-authored-markup-compose-with-no-glue
+  (def page
+    {:title "Install"
+     :content (markdown.render "## From Markdown\n\nUse `spork sync`.\n")
+     :edit-url "/edit/install"})
+  (def document
+    (markup
+      ($article {:class "prose"}
+        ($h1 (:title page))
+        (:content page)
+        (edit-page-link page))))
+  (assert (= (site.render-html document)
+             "<article class=\"prose\"><h1>Install</h1><h2>From Markdown</h2><p>Use <code>spork sync</code>.</p><a class=\"edit-link\" href=\"/edit/install\">Edit this page</a></article>")))
+
+(deftest render-file-reads-utf8-markdown
+  (with [directory (TemporaryDirectory)]
+    (def base (Path directory))
+    (def path (base.joinpath "page.md"))
+    (path.write-text "# Café\n\nFresh.\n" *{:encoding "utf-8"})
+    (assert (= (site.render-html (markdown.render-file path))
+               "<h1>Café</h1><p>Fresh.</p>"))))
+
+(deftest core-facade-exposes-unambiguous-markdown-api
+  (def result (site.render-markdown "**strong**"))
+  (assert (isinstance result site.Fragment))
+  (assert (= (site.render-html result) "<p><strong>strong</strong></p>"))
+  (assert (isinstance (site.parse-markdown "text") SyntaxTreeNode)))

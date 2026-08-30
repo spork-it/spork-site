@@ -1,0 +1,108 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run the full release test matrix
+        required: true
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      full:
+        description: Run the full release test matrix
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }} - Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ inputs.full && fromJSON('["ubuntu-latest","ubuntu-24.04-arm","windows-latest","windows-11-arm","macos-15-intel","macos-15"]') || fromJSON('["ubuntu-latest"]') }}
+        python-version: ${{ inputs.full && fromJSON('["3.10","3.11","3.12","3.13","3.14","3.14t"]') || fromJSON('["3.10","3.14","3.14t"]') }}
+        exclude:
+          - os: windows-11-arm
+            python-version: "3.10"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ (endsWith(matrix.os, '-arm') || matrix.os == 'macos-15') && 'arm64' || 'x64' }}
+          allow-prereleases: true
+
+      - name: Disable the GIL for free-threaded Python (Unix)
+        if: endsWith(matrix.python-version, 't') && runner.os != 'Windows'
+        run: echo "PYTHON_GIL=0" >> "$GITHUB_ENV"
+
+      - name: Disable the GIL for free-threaded Python (Windows)
+        if: endsWith(matrix.python-version, 't') && runner.os == 'Windows'
+        shell: pwsh
+        run: echo "PYTHON_GIL=0" >> $env:GITHUB_ENV
+
+      - name: Install Spork
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "spork-lang==0.5.3"
+
+      - name: Synchronize development environment
+        run: python -m spork sync --dev --quiet
+
+      - name: Print host information
+        run: |
+          python -VV
+          python -m spork version
+
+      - name: Check Spork sources
+        run: python -m spork check
+
+      - name: Run native Spork tests
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python -m spork test
+
+      - name: Build package sources
+        run: python -m spork build --clean
+
+      - name: Verify generated package contents
+        shell: python
+        run: |
+          from pathlib import Path
+
+          package = Path(".spork-out/spork_site")
+          modules = {"core", "markdown", "markup", "nodes", "render", "transforms"}
+          required = {package / "__init__.py"}
+          for module in modules:
+              required.update(
+                  {
+                      package / f"{module}.py",
+                      package / f"{module}.spork",
+                      package / f"{module}.spork.map.json",
+                  }
+              )
+          missing = sorted(str(path) for path in required if not path.is_file())
+          if missing:
+              raise SystemExit(f"generated package is missing: {missing}")
+
+      - name: Smoke-test generated Python package
+        env:
+          PYTHONPATH: .spork-out
+        run: >-
+          python -c "from spork_site.markdown import render;
+          from spork_site.render import render_html;
+          assert render_html(render('# Hello\n')) == '<h1>Hello</h1>'"

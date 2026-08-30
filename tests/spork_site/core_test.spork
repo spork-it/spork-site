@@ -1,4 +1,4 @@
-;; Milestone-0 tests for immutable markup, the DSL, and serialization.
+;; Tests for immutable markup, the DSL, and serialization.
 (ns spork-site.core-test
   (:require [spork-site.core :as site :refer [element fragment markup]]))
 
@@ -170,13 +170,13 @@
   (assert (= (site.render-html node)
              "<div><span class=\"badge\">new</span><strong>shown</strong></div>")))
 
-(deftest vector-comprehensions-compose-as-child-sequences
+(deftest eager-for-expressions-compose-as-child-sequences
   (def items ["one" "two" "three"])
   (def node
     (markup
       ($ul
-        [for [item items]
-          ($li item)])))
+        (for [item items]
+          ($li item)))))
   (assert (= (site.render-html node)
              "<ul><li>one</li><li>two</li><li>three</li></ul>")))
 
@@ -199,9 +199,9 @@
     (markup
       ($main {:class "content"}
         ($h1 "Spork")
-        [for [post posts]
+        (for [post posts]
           ($article {:class "post"}
             ($h2 (:title post))
-            ($p (:summary post)))])))
+            ($p (:summary post)))))))
   (assert (= (site.serialize page)
              "<main class=\"content\"><h1>Spork</h1><article class=\"post\"><h2>First</h2><p>One</p></article><article class=\"post\"><h2>Second</h2><p>Two</p></article></main>")))

@@ -1,0 +1,54 @@
+;; Generic, immutable, post-order transformations for markup trees.
+(ns spork-site.transforms
+  (:require
+    [spork-site.nodes :refer [Element Fragment RawHtml Text sequence-value?]])
+  (:import
+    [collections.abc :refer [Mapping Set :as AbstractSet]]))
+
+(defn node? [value]
+  "Return true when value is one of the four shared markup node types."
+  (or (isinstance value Element)
+      (isinstance value Fragment)
+      (isinstance value Text)
+      (isinstance value RawHtml)))
+
+(defn normalize-transform-result [value]
+  "Normalize a transform replacement into a node, Fragment, or nil."
+  (cond
+    (= value nil) nil
+    (node? value) value
+    (or (isinstance value Mapping) (isinstance value AbstractSet))
+      (throw (TypeError "node transformations cannot return maps or unordered sets"))
+    (sequence-value? value) (Fragment value)
+    :else (Text value)))
+
+(defn transform-node [node function]
+  "Transform one node post-order; replacement nodes are not revisited."
+  (let [rebuilt
+        (cond
+          (isinstance node Element)
+            (Element node.tag node.attrs
+                     (map (fn [child] (transform-node child function))
+                          node.children))
+          (isinstance node Fragment)
+            (Fragment
+              (map (fn [child] (transform-node child function))
+                   node.children))
+          (or (isinstance node Text) (isinstance node RawHtml)) node
+          :else (throw (TypeError "transform-node expects a markup node")))]
+    (normalize-transform-result (function rebuilt))))
+
+(defn transform [value function]
+  "Apply function to every node in post-order, returning an immutable tree.
+
+  The function may return a node, nil to remove a node, a deterministic
+  sequence to splice through a Fragment, or a scalar to create Text."
+  (if (not (callable function))
+    (throw (TypeError "node transform must be callable")))
+  (cond
+    (= value nil) nil
+    (node? value) (transform-node value function)
+    (or (isinstance value Mapping) (isinstance value AbstractSet))
+      (throw (TypeError "cannot transform maps or unordered sets as markup"))
+    (sequence-value? value) (transform-node (Fragment value) function)
+    :else (transform-node (Text value) function)))

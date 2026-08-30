@@ -1,4 +1,4 @@
-;; Public milestone-0 API and smoke-test entrypoint.
+;; Public node, Markdown, transformation, and serialization API.
 (ns spork-site.core
   (:require
     [spork-site.nodes :refer [Element Fragment RawHtml Text
@@ -8,7 +8,19 @@
                                scalar-string sequence-value? tag-name text]]
     [spork-site.render :refer [escape-attribute escape-text
                                 render-attributes render-html serialize]]
-    [spork-site.markup :refer [markup]]))
+    [spork-site.markup :refer [markup]]
+    [spork-site.markdown :as markdown]
+    [spork-site.transforms :refer [node? normalize-transform-result
+                                    transform transform-node]]))
+
+;; Unambiguous facade names keep Markdown parsing distinct from HTML serialization.
+(def make-markdown-parser markdown.make-parser)
+(def markdown-parser markdown.default-parser)
+(def parse-markdown markdown.parse)
+(def markdown-ast-to-nodes markdown.ast-to-nodes)
+(def render-markdown markdown.render)
+(def render-markdown-with markdown.render-with)
+(def render-markdown-file markdown.render-file)
 
 (defn ^int main [& args]
   "Render a tiny document as a command-line smoke test."

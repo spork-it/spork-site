@@ -1,0 +1,121 @@
+;; Tests for generic immutable node transformations.
+(ns spork-site.transforms-test
+  (:require
+    [spork-site.core :as site :refer [element fragment markup]]
+    [spork-site.markdown :as markdown]
+    [spork-site.transforms :as transforms]))
+
+(defn raises? [expected-type function]
+  (try
+    (do
+      (function)
+      false)
+    (catch Exception error
+      (isinstance error expected-type))))
+
+(defn heading? [node]
+  (and (isinstance node site.Element)
+       (contains? #{"h1" "h2" "h3" "h4" "h5" "h6"} node.tag)))
+
+(defn decorate-heading [node]
+  (if (heading? node)
+    (site.Element node.tag (assoc node.attrs "data-heading" true) node.children)
+    node))
+
+(deftest node-predicate-recognizes-the-shared-ir
+  (assert (transforms.node? (site.element :p "text")))
+  (assert (transforms.node? (site.fragment "text")))
+  (assert (transforms.node? (site.text "text")))
+  (assert (transforms.node? (site.raw-html "<b>x</b>")))
+  (assert (not (transforms.node? "text")))
+  (assert (not (transforms.node? nil))))
+
+(deftest transformations-are-post-order-and-immutable
+  (def original
+    (markup
+      ($section
+        ($h2 "mixed Case")
+        ($p "body"))))
+  (def transformed
+    (site.transform
+      original
+      (fn [node]
+        (cond
+          (isinstance node site.Text) (site.Text (.upper node.value))
+          (and (isinstance node site.Element) (= node.tag "h2"))
+            (site.Element node.tag
+                          (assoc node.attrs "data-text" (. (first node.children) value))
+                          node.children)
+          :else node))))
+  (assert (= (site.render-html original)
+             "<section><h2>mixed Case</h2><p>body</p></section>"))
+  (assert (= (site.render-html transformed)
+             "<section><h2 data-text=\"MIXED CASE\">MIXED CASE</h2><p>BODY</p></section>")))
+
+(deftest one-transform-treats-markdown-and-markup-identically
+  (def mixed
+    (markup
+      ($article
+        ($h2 "Authored")
+        (markdown.render "## Markdown\n\nText.\n"))))
+  (def transformed (site.transform mixed decorate-heading))
+  (assert (= (site.render-html transformed)
+             "<article><h2 data-heading>Authored</h2><h2 data-heading>Markdown</h2><p>Text.</p></article>"))
+  (assert (= (count (doall (filter heading? transformed.children))) 2)))
+
+(deftest callbacks-can-remove-and-splice-nodes
+  (def original
+    (markup
+      ($div
+        ($p {:class "remove"} "gone")
+        ($em "split"))))
+  (def transformed
+    (transforms.transform
+      original
+      (fn [node]
+        (cond
+          (and (isinstance node site.Element)
+               (= node.tag "p")
+               (= (get node.attrs "class") "remove")) nil
+          (and (isinstance node site.Element) (= node.tag "em"))
+            [(site.element :strong node.children)
+             (site.element :span "!")]
+          :else node))))
+  (assert (= (site.render-html transformed)
+             "<div><strong>split</strong><span>!</span></div>")))
+
+(deftest scalar-and-sequence-replacements-normalize-to-nodes
+  (def scalar-result
+    (transforms.transform (site.text "old")
+                          (fn [node] (if (isinstance node site.Text) 42 node))))
+  (assert (isinstance scalar-result site.Text))
+  (assert (= scalar-result.value "42"))
+  (def sequence-result
+    (transforms.transform
+      [(site.element :i "one") (site.element :i "two")]
+      (fn [node] node)))
+  (assert (isinstance sequence-result site.Fragment))
+  (assert (= (site.render-html sequence-result) "<i>one</i><i>two</i>")))
+
+(deftest raw-html-participates-without-losing-its-explicit-type
+  (def seen (list))
+  (def result
+    (transforms.transform
+      (site.fragment "safe" (site.raw-html "<b>raw</b>"))
+      (fn [node]
+        (seen.append (. (type node) __name__))
+        node)))
+  (assert (contains? (set seen) "Text"))
+  (assert (contains? (set seen) "RawHtml"))
+  (assert (contains? (set seen) "Fragment"))
+  (assert (= (site.render-html result) "safe<b>raw</b>")))
+
+(deftest invalid-transform-inputs-and-results-fail-clearly
+  (assert (raises? TypeError (fn [] (transforms.transform {} (fn [node] node)))))
+  (assert (raises? TypeError (fn [] (transforms.transform #{} (fn [node] node)))))
+  (assert (raises? TypeError (fn [] (transforms.transform (site.text "x") 42))))
+  (assert
+    (raises? TypeError
+             (fn []
+               (transforms.transform (site.text "x")
+                                     (fn [node] {:invalid "map"}))))))

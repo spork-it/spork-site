@@ -5,15 +5,38 @@
  :version "0.1.0"
  :description "Spork-native static site generation with immutable markup"
  :requires-python ">=3.10"
- :spork-version ">=0.5.1,<0.6"
+ :spork-version ">=0.5.3,<0.6"
 
  ;; Dependencies (pip-style specifications)
- :dependencies []
- :dev-dependencies []
+ :dependencies ["markdown-it-py>=4,<5"]
+ :dev-dependencies ["twine>=5"]
 
  ;; Source code locations
  :source-paths ["src"]
  :test-paths ["tests"]
+
+ ;; Distribution metadata
+ :readme "README.md"
+ :license "MIT"
+ :license-file "LICENSE"
+ :authors [{:name "Grant Wade" :email "grant@spork.sh"}]
+ :keywords ["spork" "static-site-generator" "markup" "markdown" "html"]
+ :classifiers ["Development Status :: 3 - Alpha"
+               "Intended Audience :: Developers"
+               "Operating System :: OS Independent"
+               "Programming Language :: Lisp"
+               "Programming Language :: Python :: 3"
+               "Programming Language :: Python :: 3.10"
+               "Programming Language :: Python :: 3.11"
+               "Programming Language :: Python :: 3.12"
+               "Programming Language :: Python :: 3.13"
+               "Programming Language :: Python :: 3.14"
+               "Topic :: Internet :: WWW/HTTP :: Site Management"]
+ :urls {:Homepage "https://github.com/spork-it/spork-site"
+        :Documentation "https://github.com/spork-it/spork-site#readme"
+        :Repository "https://github.com/spork-it/spork-site"
+        :Issues "https://github.com/spork-it/spork-site/issues"
+        :Changelog "https://github.com/spork-it/spork-site/blob/main/CHANGELOG.md"}
 
  ;; Entry point for 'spork run'
  :main "spork-site.core:main"}
