@@ -1,5 +1,5 @@
 ;; Spork Project Manifest
-;; See https://github.com/spork-it/spork-lang/blob/main/docs/PROJECTS.md
+;; See https://spork.sh/docs/reference/tooling/
 
 {:name "spork-site"
  :version "0.1.1"
@@ -35,8 +35,8 @@
                "Programming Language :: Python :: 3.13"
                "Programming Language :: Python :: 3.14"
                "Topic :: Internet :: WWW/HTTP :: Site Management"]
- :urls {:Homepage "https://github.com/spork-it/spork-site"
-        :Documentation "https://github.com/spork-it/spork-site#readme"
+ :urls {:Homepage "https://spork.sh/docs/packages/spork-site/"
+        :Documentation "https://spork.sh/docs/packages/spork-site/"
         :Repository "https://github.com/spork-it/spork-site"
         :Issues "https://github.com/spork-it/spork-site/issues"
         :Changelog "https://github.com/spork-it/spork-site/blob/main/CHANGELOG.md"}
