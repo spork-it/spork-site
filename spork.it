@@ -22,7 +22,7 @@
  :readme "README.md"
  :license "MIT"
  :license-file "LICENSE"
- :authors [{:name "Grant Wade" :email "grant@spork.sh"}]
+ :authors [{:name "Grant Wade" :email "grant@wade.software"}]
  :keywords ["spork" "static-site-generator" "markup" "markdown" "html"]
  :classifiers ["Development Status :: 3 - Alpha"
                "Intended Audience :: Developers"
